@@ -77,7 +77,6 @@ impl AnalysisResult {
 pub fn analyze(
     overview: Overview,
     packets: Vec<PacketMeta>,
-    raw_packets: Vec<crate::parser::PacketMeta>,
     geo_enabled: bool,
 ) -> Result<AnalysisResult> {
     let timeline = build_timeline(&packets, &overview);

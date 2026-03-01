@@ -1,8 +1,7 @@
-use std::collections::HashMap;
 use anyhow::{anyhow, Result};
-use chrono::{DateTime, Utc, TimeZone};
+use chrono::{TimeZone, Utc};
+use pcap_parser::traits::PcapReaderIterator;
 use pcap_parser::*;
-use pcap_parser::data::PacketData;
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::{self, AnalysisResult, Overview};
@@ -83,14 +82,18 @@ pub struct ArpLayer {
 
 pub fn parse_capture(data: &[u8], filename: &str, geo_enabled: bool) -> Result<AnalysisResult> {
     let mut packets: Vec<PacketMeta> = Vec::new();
-    let mut raw_packets: Vec<RawPacket> = Vec::new();
     let mut total_count = 0usize;
     let mut first_ts: Option<f64> = None;
     let mut last_ts: Option<f64> = None;
 
-    let capture_result = parse_pcap_or_pcapng(data, filename, &mut packets, &mut raw_packets, &mut total_count, &mut first_ts, &mut last_ts);
+    let result = if filename.ends_with(".pcapng") || filename.ends_with(".npcapng") {
+        parse_pcapng(data, &mut packets, &mut total_count, &mut first_ts, &mut last_ts)
+    } else {
+        parse_pcap(data, &mut packets, &mut total_count, &mut first_ts, &mut last_ts)
+            .or_else(|_| parse_pcapng(data, &mut packets, &mut total_count, &mut first_ts, &mut last_ts))
+    };
 
-    if let Err(e) = capture_result {
+    if let Err(e) = result {
         return Err(anyhow!("Parse error: {}", e));
     }
 
@@ -98,6 +101,13 @@ pub fn parse_capture(data: &[u8], filename: &str, geo_enabled: bool) -> Result<A
         (Some(f), Some(l)) => l - f,
         _ => 0.0,
     };
+
+    if total_count > MAX_INSPECTOR_PACKETS {
+        eprintln!(
+            "Warning: capture contains {} packets; inspector limited to first {}",
+            total_count, MAX_INSPECTOR_PACKETS
+        );
+    }
 
     let overview = Overview {
         filename: filename.to_string(),
@@ -109,74 +119,46 @@ pub fn parse_capture(data: &[u8], filename: &str, geo_enabled: bool) -> Result<A
         analyzed_at: Utc::now().to_rfc3339(),
     };
 
-    if total_count > MAX_INSPECTOR_PACKETS {
-        eprintln!(
-            "Warning: capture contains {} packets; inspector limited to first {}",
-            total_count, MAX_INSPECTOR_PACKETS
-        );
-    }
-
-    let result = analysis::analyze(overview, packets, raw_packets, geo_enabled)?;
-    Ok(result)
-}
-
-struct RawPacket {
-    pub timestamp: f64,
-    pub data: Vec<u8>,
-    pub orig_len: u32,
-}
-
-fn parse_pcap_or_pcapng(
-    data: &[u8],
-    filename: &str,
-    packets: &mut Vec<PacketMeta>,
-    raw_packets: &mut Vec<RawPacket>,
-    total_count: &mut usize,
-    first_ts: &mut Option<f64>,
-    last_ts: &mut Option<f64>,
-) -> Result<()> {
-    // Try pcap first, then pcapng
-    if filename.ends_with(".pcapng") || filename.ends_with(".npcapng") {
-        parse_pcapng(data, packets, raw_packets, total_count, first_ts, last_ts)
-    } else {
-        parse_pcap(data, packets, raw_packets, total_count, first_ts, last_ts)
-            .or_else(|_| parse_pcapng(data, packets, raw_packets, total_count, first_ts, last_ts))
-    }
+    analysis::analyze(overview, packets, geo_enabled)
 }
 
 fn parse_pcap(
     data: &[u8],
     packets: &mut Vec<PacketMeta>,
-    raw_packets: &mut Vec<RawPacket>,
     total_count: &mut usize,
     first_ts: &mut Option<f64>,
     last_ts: &mut Option<f64>,
 ) -> Result<()> {
-    let mut reader = PcapReader::new(data).map_err(|e| anyhow!("{:?}", e))?;
-    let linktype = reader.header.network;
+    let mut reader = LegacyPcapReader::new(65536, data).map_err(|e| anyhow!("{:?}", e))?;
+    let mut linktype = Linktype::ETHERNET;
 
     loop {
         match reader.next() {
-            Ok((remaining, block)) => {
-                let ts = block.ts_sec as f64 + block.ts_usec as f64 / 1_000_000.0;
-                if first_ts.is_none() {
-                    *first_ts = Some(ts);
-                }
-                *last_ts = Some(ts);
-                *total_count += 1;
+            Ok((offset, block)) => {
+                match &block {
+                    PcapBlockOwned::LegacyHeader(hdr) => {
+                        linktype = hdr.network;
+                    }
+                    PcapBlockOwned::Legacy(pkt) => {
+                        let ts = pkt.ts_sec as f64 + pkt.ts_usec as f64 / 1_000_000.0;
+                        if first_ts.is_none() {
+                            *first_ts = Some(ts);
+                        }
+                        *last_ts = Some(ts);
+                        *total_count += 1;
 
-                if *total_count <= MAX_INSPECTOR_PACKETS {
-                    let raw_data = block.data.to_vec();
-                    let meta = decode_packet(*total_count - 1, ts, &raw_data, linktype);
-                    raw_packets.push(RawPacket { timestamp: ts, data: raw_data, orig_len: block.origlen });
-                    packets.push(meta);
+                        if *total_count <= MAX_INSPECTOR_PACKETS {
+                            let raw_data = pkt.data.to_vec();
+                            let meta = decode_packet(*total_count - 1, ts, &raw_data, linktype);
+                            packets.push(meta);
+                        }
+                    }
+                    _ => {}
                 }
-
-                if remaining.is_empty() {
-                    break;
-                }
+                reader.consume(offset);
             }
             Err(PcapError::Eof) => break,
+            Err(PcapError::Incomplete(_)) => break,
             Err(e) => return Err(anyhow!("pcap read error: {:?}", e)),
         }
     }
@@ -186,49 +168,53 @@ fn parse_pcap(
 fn parse_pcapng(
     data: &[u8],
     packets: &mut Vec<PacketMeta>,
-    raw_packets: &mut Vec<RawPacket>,
     total_count: &mut usize,
     first_ts: &mut Option<f64>,
     last_ts: &mut Option<f64>,
 ) -> Result<()> {
     let mut reader = PcapNGReader::new(65536, data).map_err(|e| anyhow!("{:?}", e))?;
     let mut linktype = Linktype::ETHERNET;
+    let mut ts_resolution: f64 = 1_000_000.0; // default microseconds
 
     loop {
         match reader.next() {
-            Ok((_, block)) => {
-                match block {
+            Ok((offset, block)) => {
+                match &block {
                     PcapBlockOwned::NG(Block::SectionHeader(_)) => {}
                     PcapBlockOwned::NG(Block::InterfaceDescription(idb)) => {
                         linktype = idb.linktype;
+                        // if_tsresol option can change resolution, default is microseconds
+                        ts_resolution = 1_000_000.0;
                     }
                     PcapBlockOwned::NG(Block::EnhancedPacket(epb)) => {
                         let ts_raw = (epb.ts_high as u64) << 32 | epb.ts_low as u64;
-                        let ts = ts_raw as f64 / 1_000_000.0;
-                        if first_ts.is_none() { *first_ts = Some(ts); }
+                        let ts = ts_raw as f64 / ts_resolution;
+                        if first_ts.is_none() {
+                            *first_ts = Some(ts);
+                        }
                         *last_ts = Some(ts);
                         *total_count += 1;
                         if *total_count <= MAX_INSPECTOR_PACKETS {
                             let raw_data = epb.data.to_vec();
                             let meta = decode_packet(*total_count - 1, ts, &raw_data, linktype);
-                            raw_packets.push(RawPacket { timestamp: ts, data: raw_data, orig_len: epb.origlen });
                             packets.push(meta);
                         }
                     }
                     PcapBlockOwned::NG(Block::SimplePacket(spb)) => {
-                        *total_count += 1;
                         let ts = first_ts.unwrap_or(0.0);
+                        *total_count += 1;
                         if *total_count <= MAX_INSPECTOR_PACKETS {
                             let raw_data = spb.data.to_vec();
                             let meta = decode_packet(*total_count - 1, ts, &raw_data, linktype);
-                            raw_packets.push(RawPacket { timestamp: ts, data: raw_data, orig_len: spb.origlen as u32 });
                             packets.push(meta);
                         }
                     }
                     _ => {}
                 }
+                reader.consume(offset);
             }
             Err(PcapError::Eof) => break,
+            Err(PcapError::Incomplete(_)) => break,
             Err(e) => return Err(anyhow!("pcapng read error: {:?}", e)),
         }
     }
@@ -303,7 +289,7 @@ fn decode_ethernet(data: &[u8], meta: &mut PacketMeta) {
 
     match ether_type {
         0x0800 => decode_ipv4(payload, meta),
-        0x0806 => decode_arp(payload, meta, &src_mac, &dst_mac),
+        0x0806 => decode_arp(payload, meta),
         0x86DD => decode_ipv6(payload, meta),
         _ => {
             meta.protocol = format!("Ethernet (0x{:04X})", ether_type);
@@ -311,7 +297,7 @@ fn decode_ethernet(data: &[u8], meta: &mut PacketMeta) {
     }
 }
 
-fn decode_arp(data: &[u8], meta: &mut PacketMeta, src_mac: &str, dst_mac: &str) {
+fn decode_arp(data: &[u8], meta: &mut PacketMeta) {
     if data.len() < 28 {
         meta.protocol = "ARP".to_string();
         return;
@@ -357,7 +343,9 @@ fn decode_ipv4(data: &[u8], meta: &mut PacketMeta) {
         if flags_raw & 0x04 != 0 { "Reserved " } else { "" },
         if flags_raw & 0x02 != 0 { "DF " } else { "" },
         if flags_raw & 0x01 != 0 { "MF" } else { "" }
-    ).trim().to_string();
+    )
+    .trim()
+    .to_string();
 
     meta.src_ip = Some(src.clone());
     meta.dst_ip = Some(dst.clone());
@@ -433,21 +421,30 @@ fn decode_tcp(data: &[u8], meta: &mut PacketMeta, src: &str, dst: &str) {
     meta.src_port = Some(src_port);
     meta.dst_port = Some(dst_port);
     meta.protocol = "TCP".to_string();
-    meta.info = format!("{} -> {} [{}] Seq={} Ack={} Win={}", src_port, dst_port, flags, seq, ack, window);
+    meta.info = format!(
+        "{} -> {} [{}] Seq={} Ack={} Win={}",
+        src_port, dst_port, flags, seq, ack, window
+    );
 
     meta.layers.transport = Some(TransportLayer {
         protocol: "TCP".to_string(),
         src_port,
         dst_port,
-        flags: Some(flags.clone()),
+        flags: Some(flags),
         seq: Some(seq),
         ack: Some(ack),
         window: Some(window),
     });
 
-    let app_payload = if data_offset < data.len() { &data[data_offset..] } else { &[] };
+    let app_payload = if data_offset < data.len() {
+        &data[data_offset..]
+    } else {
+        &[]
+    };
 
-    if (src_port == 80 || dst_port == 80 || src_port == 8080 || dst_port == 8080) && !app_payload.is_empty() {
+    if (src_port == 80 || dst_port == 80 || src_port == 8080 || dst_port == 8080)
+        && !app_payload.is_empty()
+    {
         if let Some(http) = decode_http(app_payload) {
             meta.protocol = "HTTP".to_string();
             meta.layers.application = Some(ApplicationLayer {
@@ -518,15 +515,18 @@ fn decode_http(data: &[u8]) -> Option<serde_json::Value> {
         return None;
     }
     let first = lines[0];
-
-    // Request
     let parts: Vec<&str> = first.splitn(3, ' ').collect();
     if parts.len() == 3 {
         let method = parts[0];
-        if matches!(method, "GET" | "POST" | "PUT" | "DELETE" | "HEAD" | "OPTIONS" | "PATCH") {
+        if matches!(
+            method,
+            "GET" | "POST" | "PUT" | "DELETE" | "HEAD" | "OPTIONS" | "PATCH"
+        ) {
             let mut headers = serde_json::Map::new();
             for line in &lines[1..] {
-                if line.is_empty() { break; }
+                if line.is_empty() {
+                    break;
+                }
                 if let Some((k, v)) = line.split_once(": ") {
                     headers.insert(k.to_string(), serde_json::Value::String(v.to_string()));
                 }
@@ -539,12 +539,13 @@ fn decode_http(data: &[u8]) -> Option<serde_json::Value> {
                 "headers": headers
             }));
         }
-        // Response
         if parts[0].starts_with("HTTP/") {
             let status: u16 = parts[1].parse().unwrap_or(0);
             let mut headers = serde_json::Map::new();
             for line in &lines[1..] {
-                if line.is_empty() { break; }
+                if line.is_empty() {
+                    break;
+                }
                 if let Some((k, v)) = line.split_once(": ") {
                     headers.insert(k.to_string(), serde_json::Value::String(v.to_string()));
                 }
@@ -572,7 +573,7 @@ fn decode_dns(data: &[u8]) -> Option<serde_json::Value> {
     let acount = u16::from_be_bytes([data[6], data[7]]);
 
     let mut questions = Vec::new();
-    let mut offset = 12;
+    let mut offset = 12usize;
 
     for _ in 0..qcount {
         if let Some((name, new_offset)) = parse_dns_name(data, offset) {
@@ -598,15 +599,27 @@ fn decode_dns(data: &[u8]) -> Option<serde_json::Value> {
             offset = new_offset;
             if offset + 10 <= data.len() {
                 let rtype = u16::from_be_bytes([data[offset], data[offset + 1]]);
-                let _rclass = u16::from_be_bytes([data[offset + 2], data[offset + 3]]);
-                let ttl = u32::from_be_bytes([data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7]]);
+                let ttl = u32::from_be_bytes([
+                    data[offset + 4],
+                    data[offset + 5],
+                    data[offset + 6],
+                    data[offset + 7],
+                ]);
                 let rdlen = u16::from_be_bytes([data[offset + 8], data[offset + 9]]) as usize;
                 offset += 10;
-                let rdata = if offset + rdlen <= data.len() { &data[offset..offset + rdlen] } else { &[] };
+                let rdata = if offset + rdlen <= data.len() {
+                    &data[offset..offset + rdlen]
+                } else {
+                    &[]
+                };
                 let rdata_str = match rtype {
-                    1 if rdata.len() == 4 => format!("{}.{}.{}.{}", rdata[0], rdata[1], rdata[2], rdata[3]),
+                    1 if rdata.len() == 4 => {
+                        format!("{}.{}.{}.{}", rdata[0], rdata[1], rdata[2], rdata[3])
+                    }
                     28 if rdata.len() == 16 => format_ipv6(rdata),
-                    5 | 2 | 12 => parse_dns_name(rdata, 0).map(|(n, _)| n).unwrap_or_default(),
+                    5 | 2 | 12 => parse_dns_name(rdata, 0)
+                        .map(|(n, _)| n)
+                        .unwrap_or_default(),
                     _ => hex_short(rdata),
                 };
                 offset += rdlen;
@@ -632,9 +645,7 @@ fn decode_dns(data: &[u8]) -> Option<serde_json::Value> {
 
 fn parse_dns_name(data: &[u8], mut offset: usize) -> Option<(String, usize)> {
     let mut name = String::new();
-    let mut jumped = false;
     let mut jump_limit = 10;
-    let orig_offset = offset;
 
     loop {
         if offset >= data.len() {
@@ -648,17 +659,16 @@ fn parse_dns_name(data: &[u8], mut offset: usize) -> Option<(String, usize)> {
             if offset + 1 >= data.len() {
                 return None;
             }
-            let ptr = ((len & 0x3F) << 8 | data[offset + 1] as usize);
-            if !jumped {
-                offset += 2;
-            }
-            jumped = true;
+            let ptr = (len & 0x3F) << 8 | data[offset + 1] as usize;
+            offset += 2;
             if jump_limit == 0 {
                 return None;
             }
             jump_limit -= 1;
             let (part, _) = parse_dns_name(data, ptr)?;
-            if !name.is_empty() { name.push('.'); }
+            if !name.is_empty() {
+                name.push('.');
+            }
             name.push_str(&part);
             return Some((name, offset));
         } else {
@@ -666,8 +676,12 @@ fn parse_dns_name(data: &[u8], mut offset: usize) -> Option<(String, usize)> {
             if offset + len > data.len() {
                 return None;
             }
-            if !name.is_empty() { name.push('.'); }
-            name.push_str(std::str::from_utf8(&data[offset..offset + len]).unwrap_or("?"));
+            if !name.is_empty() {
+                name.push('.');
+            }
+            name.push_str(
+                std::str::from_utf8(&data[offset..offset + len]).unwrap_or("?"),
+            );
             offset += len;
         }
     }
@@ -688,32 +702,58 @@ fn tcp_flags(f: u8) -> String {
 }
 
 fn format_mac(b: &[u8]) -> String {
-    format!("{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}", b[0], b[1], b[2], b[3], b[4], b[5])
+    format!(
+        "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+        b[0], b[1], b[2], b[3], b[4], b[5]
+    )
 }
 
 fn format_ipv6(b: &[u8]) -> String {
-    if b.len() < 16 { return "::".to_string(); }
-    let groups: Vec<String> = b.chunks(2).map(|c| format!("{:02x}{:02x}", c[0], c[1])).collect();
+    if b.len() < 16 {
+        return "::".to_string();
+    }
+    let groups: Vec<String> = b
+        .chunks(2)
+        .map(|c| format!("{:02x}{:02x}", c[0], c[1]))
+        .collect();
     groups.join(":")
 }
 
 fn dns_type_str(t: u16) -> &'static str {
     match t {
-        1 => "A", 2 => "NS", 5 => "CNAME", 6 => "SOA",
-        12 => "PTR", 15 => "MX", 16 => "TXT", 28 => "AAAA",
-        33 => "SRV", 255 => "ANY", _ => "Unknown"
+        1 => "A",
+        2 => "NS",
+        5 => "CNAME",
+        6 => "SOA",
+        12 => "PTR",
+        15 => "MX",
+        16 => "TXT",
+        28 => "AAAA",
+        33 => "SRV",
+        255 => "ANY",
+        _ => "Unknown",
     }
 }
 
 fn hex_dump(data: &[u8]) -> String {
-    let lines: Vec<String> = data.chunks(16).enumerate().map(|(i, chunk)| {
-        let hex: Vec<String> = chunk.iter().map(|b| format!("{:02X}", b)).collect();
-        let ascii: String = chunk.iter().map(|&b| if b >= 0x20 && b < 0x7F { b as char } else { '.' }).collect();
-        format!("{:04X}  {:<48}  {}", i * 16, hex.join(" "), ascii)
-    }).collect();
+    let lines: Vec<String> = data
+        .chunks(16)
+        .enumerate()
+        .map(|(i, chunk)| {
+            let hex: Vec<String> = chunk.iter().map(|b| format!("{:02X}", b)).collect();
+            let ascii: String = chunk
+                .iter()
+                .map(|&b| if b >= 0x20 && b < 0x7F { b as char } else { '.' })
+                .collect();
+            format!("{:04X}  {:<48}  {}", i * 16, hex.join(" "), ascii)
+        })
+        .collect();
     lines.join("\n")
 }
 
 fn hex_short(data: &[u8]) -> String {
-    data.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ")
+    data.iter()
+        .map(|b| format!("{:02X}", b))
+        .collect::<Vec<_>>()
+        .join(" ")
 }

@@ -2,7 +2,6 @@ mod parser;
 mod analysis;
 mod export;
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -22,7 +21,6 @@ use tower_http::services::ServeDir;
 use uuid::Uuid;
 
 use crate::analysis::AnalysisResult;
-use crate::parser::ParsedCapture;
 
 static FRONTEND_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../frontend/dist");
 
@@ -87,6 +85,7 @@ async fn upload_handler(
         let name = field.name().unwrap_or("").to_string();
         if name == "file" {
             let filename = field.file_name().unwrap_or("upload.pcap").to_string();
+            let filename_clone = filename.clone();
             let data = match field.bytes().await {
                 Ok(b) => b.to_vec(),
                 Err(e) => {
@@ -127,7 +126,7 @@ async fn upload_handler(
 
             return Json(json!({
                 "session_id": session_id,
-                "filename": filename
+                "filename": filename_clone
             }))
             .into_response();
         }
