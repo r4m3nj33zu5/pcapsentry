@@ -1,6 +1,5 @@
 use std::net::IpAddr;
 use std::str::FromStr;
-use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use crate::parser::PacketMeta;
 

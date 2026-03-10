@@ -45,51 +45,34 @@
 
 <style>
   .sidebar {
-    width: 200px;
-    background: #161b22;
-    border-right: 1px solid #21262d;
+    width: 100%;
+    height: 100%;
+    background: #000000;
     display: flex;
     flex-direction: column;
     flex-shrink: 0;
     position: relative;
-    transition: width 0.2s;
   }
   .sidebar.collapsed {
-    width: 28px;
+    width: 0;
   }
-  .toggle {
-    position: absolute;
-    top: 12px;
-    right: -12px;
-    z-index: 10;
-    width: 22px;
-    height: 22px;
-    border-radius: 50%;
-    background: #21262d;
-    border: 1px solid #30363d;
-    color: #8b949e;
-    font-size: 0.85rem;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 0;
-  }
-  .toggle:hover { color: #e6edf3; }
+  .toggle { display: none; }
   .sidebar-header {
     padding: 1rem 0.75rem 0.5rem;
-    font-size: 0.7rem;
+    font-size: 0.65rem;
     font-weight: 700;
-    color: #8b949e;
+    font-family: 'Syne', 'Inter', sans-serif;
+    color: #383838;
     text-transform: uppercase;
-    letter-spacing: 0.08em;
+    letter-spacing: 0.12em;
     white-space: nowrap;
     overflow: hidden;
   }
   .empty {
     padding: 0.5rem 0.75rem;
-    font-size: 0.78rem;
-    color: #484f58;
+    font-size: 0.75rem;
+    color: #303030;
+    letter-spacing: 0.02em;
   }
   .session-list {
     overflow-y: auto;
@@ -99,27 +82,29 @@
     width: 100%;
     background: none;
     border: none;
-    border-bottom: 1px solid #21262d;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
     padding: 0.6rem 0.75rem;
     cursor: pointer;
     text-align: left;
+    transition: background 0.1s;
   }
-  .session-item:hover { background: #21262d; }
-  .session-item.active { background: #1f3a5f; }
+  .session-item:hover { background: rgba(255,255,255,0.03); }
+  .session-item.active { background: rgba(255,255,255,0.04); border-left: 1px solid #c8d8f0; }
   .s-filename {
-    font-size: 0.78rem;
-    color: #e6edf3;
+    font-size: 0.75rem;
+    color: #909090;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     margin-bottom: 0.2rem;
   }
+  .session-item.active .s-filename { color: #f0f0f0; }
   .s-meta {
     display: flex;
     align-items: center;
     gap: 0.5rem;
-    font-size: 0.7rem;
-    color: #8b949e;
+    font-size: 0.68rem;
+    color: #404040;
   }
-  .sev-dot { font-size: 0.6rem; }
+  .sev-dot { font-size: 0.55rem; }
 </style>

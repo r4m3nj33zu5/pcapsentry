@@ -2,6 +2,15 @@ pub mod threats;
 pub mod talkers;
 pub mod dns_http;
 pub mod geo;
+pub mod icmp;
+pub mod flows;
+pub mod utils;
+pub mod alerts;
+pub mod executive;
+pub mod tls;
+pub mod ioc;
+pub mod proto_hierarchy;
+pub mod timeline_events;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -11,6 +20,13 @@ use self::threats::ThreatFinding;
 use self::talkers::TalkerStats;
 use self::dns_http::{DnsEntry, HttpEntry};
 use self::geo::GeoPoint;
+use self::flows::ConnectionFlow;
+use self::alerts::AlertFinding;
+use self::executive::ExecutiveSummary;
+use self::tls::TlsSession;
+use self::ioc::IocBundle;
+use self::proto_hierarchy::ProtoNode;
+use self::timeline_events::TimelineEvent;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Overview {
@@ -37,6 +53,37 @@ pub struct ProtocolStat {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IcmpSummary {
+    pub echo_requests: usize,
+    pub echo_replies: usize,
+    pub unique_sources: usize,
+    pub unique_targets: usize,
+    pub top_pairs: Vec<IcmpPair>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IcmpPair {
+    pub src: String,
+    pub dst: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortStat {
+    pub port: u16,
+    pub packet_count: usize,
+    pub service: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PacketSizeStats {
+    pub min: usize,
+    pub max: usize,
+    pub avg: usize,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalysisResult {
     pub overview: Overview,
     pub timeline: Vec<TimelineBucket>,
@@ -47,27 +94,48 @@ pub struct AnalysisResult {
     pub geo_points: Vec<GeoPoint>,
     pub dns_log: Vec<DnsEntry>,
     pub http_log: Vec<HttpEntry>,
+    pub icmp_summary: IcmpSummary,
+    pub top_ports: Vec<PortStat>,
+    pub packet_size_stats: PacketSizeStats,
+    pub flows: Vec<ConnectionFlow>,
     pub packets: Vec<PacketMeta>,
+    // New SOC fields (all with serde default for backward compat)
+    #[serde(default)]
+    pub alerts: Vec<AlertFinding>,
+    #[serde(default)]
+    pub executive: Option<ExecutiveSummary>,
+    #[serde(default)]
+    pub tls_sessions: Vec<TlsSession>,
+    #[serde(default)]
+    pub ioc_bundle: Option<IocBundle>,
+    #[serde(default)]
+    pub timeline_events: Vec<TimelineEvent>,
+    #[serde(default)]
+    pub proto_hierarchy: Vec<ProtoNode>,
+    #[serde(default)]
+    pub notes: String,
 }
 
 impl AnalysisResult {
     pub fn highest_severity(&self) -> &'static str {
+        // Check new alerts first
+        for a in &self.alerts {
+            if a.severity == "Critical" { return "Critical"; }
+        }
+        for a in &self.alerts {
+            if a.severity == "High" { return "High"; }
+        }
+        // Fall back to old threats
         for finding in &self.threats {
-            if finding.severity == "Critical" {
-                return "Critical";
-            }
+            if finding.severity == "Critical" { return "Critical"; }
         }
         for finding in &self.threats {
-            if finding.severity == "High" {
-                return "High";
-            }
+            if finding.severity == "High" { return "High"; }
         }
         for finding in &self.threats {
-            if finding.severity == "Medium" {
-                return "Medium";
-            }
+            if finding.severity == "Medium" { return "Medium"; }
         }
-        if !self.threats.is_empty() {
+        if !self.threats.is_empty() || !self.alerts.is_empty() {
             return "Info";
         }
         "None"
@@ -89,6 +157,18 @@ pub fn analyze(
         Vec::new()
     };
     let (dns_log, http_log) = dns_http::extract(&packets);
+    let icmp_summary = icmp::summarize(&packets);
+    let top_ports = compute_top_ports(&packets);
+    let packet_size_stats = compute_packet_size_stats(&packets);
+    let connection_flows = flows::compute(&packets);
+
+    // New SOC analysis
+    let alert_findings = alerts::detect(&packets, &connection_flows, &dns_log);
+    let tls_sessions = tls::extract(&packets);
+    let ioc = ioc::build_bundle(&packets, &dns_log, &http_log, &geo_points);
+    let proto_hier = proto_hierarchy::build(&packets);
+    let timeline_evts = timeline_events::merge(&alert_findings, &dns_log, &http_log, &tls_sessions);
+    let exec = executive::summarize(&alert_findings, &connection_flows, &geo_points, &overview, &tls_sessions);
 
     Ok(AnalysisResult {
         overview,
@@ -100,7 +180,18 @@ pub fn analyze(
         geo_points,
         dns_log,
         http_log,
+        icmp_summary,
+        top_ports,
+        packet_size_stats,
+        flows: connection_flows,
         packets,
+        alerts: alert_findings,
+        executive: Some(exec),
+        tls_sessions,
+        ioc_bundle: Some(ioc),
+        timeline_events: timeline_evts,
+        proto_hierarchy: proto_hier,
+        notes: String::new(),
     })
 }
 
@@ -147,4 +238,65 @@ fn build_protocol_stats(packets: &[PacketMeta]) -> Vec<ProtocolStat> {
         .collect();
     stats.sort_by(|a, b| b.count.cmp(&a.count));
     stats
+}
+
+fn port_service(port: u16) -> &'static str {
+    match port {
+        80 => "HTTP",
+        443 => "HTTPS",
+        22 => "SSH",
+        53 => "DNS",
+        25 => "SMTP",
+        21 => "FTP",
+        23 => "Telnet",
+        3389 => "RDP",
+        8080 => "HTTP-Alt",
+        8443 => "HTTPS-Alt",
+        3306 => "MySQL",
+        5432 => "PostgreSQL",
+        6379 => "Redis",
+        27017 => "MongoDB",
+        4444 => "Metasploit",
+        31337 => "Back Orifice",
+        12345 => "NetBus",
+        6666 | 6667 => "IRC/C2",
+        1337 => "Backdoor",
+        _ => "Unknown",
+    }
+}
+
+fn compute_top_ports(packets: &[PacketMeta]) -> Vec<PortStat> {
+    let mut counts: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
+    for pkt in packets {
+        if let Some(port) = pkt.dst_port {
+            *counts.entry(port).or_insert(0) += 1;
+        }
+    }
+    let mut stats: Vec<PortStat> = counts
+        .into_iter()
+        .map(|(port, packet_count)| PortStat {
+            service: port_service(port).to_string(),
+            port,
+            packet_count,
+        })
+        .collect();
+    stats.sort_by(|a, b| b.packet_count.cmp(&a.packet_count));
+    stats.truncate(15);
+    stats
+}
+
+fn compute_packet_size_stats(packets: &[PacketMeta]) -> PacketSizeStats {
+    if packets.is_empty() {
+        return PacketSizeStats { min: 0, max: 0, avg: 0, total_bytes: 0 };
+    }
+    let mut min = usize::MAX;
+    let mut max = 0usize;
+    let mut total_bytes: u64 = 0;
+    for pkt in packets {
+        if pkt.length < min { min = pkt.length; }
+        if pkt.length > max { max = pkt.length; }
+        total_bytes += pkt.length as u64;
+    }
+    let avg = (total_bytes / packets.len() as u64) as usize;
+    PacketSizeStats { min, max, avg, total_bytes }
 }

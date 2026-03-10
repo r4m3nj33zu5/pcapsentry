@@ -3,6 +3,8 @@ use chrono::{TimeZone, Utc};
 use pcap_parser::traits::PcapReaderIterator;
 use pcap_parser::*;
 use serde::{Deserialize, Serialize};
+#[allow(unused_imports)]
+use md5;
 
 use crate::analysis::{self, AnalysisResult, Overview};
 
@@ -24,6 +26,9 @@ pub struct PacketMeta {
     pub info: String,
     pub layers: PacketLayers,
     pub raw_hex: String,
+    /// First 64 bytes of application-layer payload (hex-encoded).
+    #[serde(default)]
+    pub app_payload_preview: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -131,6 +136,8 @@ fn parse_pcap(
 ) -> Result<()> {
     let mut reader = LegacyPcapReader::new(65536, data).map_err(|e| anyhow!("{:?}", e))?;
     let mut linktype = Linktype::ETHERNET;
+    // 0xa1b23c4d = nanosecond-precision pcap magic (PCAP_NSEC_MAGIC)
+    let mut ts_divisor = 1_000_000.0f64;
 
     loop {
         match reader.next() {
@@ -138,9 +145,12 @@ fn parse_pcap(
                 match &block {
                     PcapBlockOwned::LegacyHeader(hdr) => {
                         linktype = hdr.network;
+                        if hdr.magic_number == 0xa1b23c4d {
+                            ts_divisor = 1_000_000_000.0;
+                        }
                     }
                     PcapBlockOwned::Legacy(pkt) => {
-                        let ts = pkt.ts_sec as f64 + pkt.ts_usec as f64 / 1_000_000.0;
+                        let ts = pkt.ts_sec as f64 + pkt.ts_usec as f64 / ts_divisor;
                         if first_ts.is_none() {
                             *first_ts = Some(ts);
                         }
@@ -165,6 +175,25 @@ fn parse_pcap(
     Ok(())
 }
 
+/// Read the `if_tsresol` option from a pcapng Interface Description Block.
+/// Returns timestamp units per second (e.g. 1_000_000 for µs, 1_000_000_000 for ns).
+/// Defaults to 1_000_000 (microseconds) if absent, per the pcapng spec.
+fn read_tsresol(options: &[PcapNGOption<'_>]) -> f64 {
+    for opt in options {
+        if opt.code == OptionCode(9) {
+            if let Some(&byte) = opt.value.first() {
+                // bit 7: 0 = power-of-10, 1 = power-of-2
+                return if byte & 0x80 == 0 {
+                    10f64.powi((byte & 0x7f) as i32)
+                } else {
+                    2f64.powi((byte & 0x7f) as i32)
+                };
+            }
+        }
+    }
+    1_000_000.0 // default: microseconds
+}
+
 fn parse_pcapng(
     data: &[u8],
     packets: &mut Vec<PacketMeta>,
@@ -183,8 +212,7 @@ fn parse_pcapng(
                     PcapBlockOwned::NG(Block::SectionHeader(_)) => {}
                     PcapBlockOwned::NG(Block::InterfaceDescription(idb)) => {
                         linktype = idb.linktype;
-                        // if_tsresol option can change resolution, default is microseconds
-                        ts_resolution = 1_000_000.0;
+                        ts_resolution = read_tsresol(&idb.options);
                     }
                     PcapBlockOwned::NG(Block::EnhancedPacket(epb)) => {
                         let ts_raw = (epb.ts_high as u64) << 32 | epb.ts_low as u64;
@@ -247,6 +275,7 @@ fn decode_packet(index: usize, timestamp: f64, data: &[u8], linktype: Linktype) 
         info: String::new(),
         layers: PacketLayers::default(),
         raw_hex,
+        app_payload_preview: String::new(),
     };
 
     match linktype {
@@ -404,7 +433,7 @@ fn decode_ip_protocol(protocol: u8, payload: &[u8], meta: &mut PacketMeta, src: 
     }
 }
 
-fn decode_tcp(data: &[u8], meta: &mut PacketMeta, src: &str, dst: &str) {
+fn decode_tcp(data: &[u8], meta: &mut PacketMeta, _src: &str, _dst: &str) {
     if data.len() < 20 {
         meta.protocol = "TCP".to_string();
         return;
@@ -442,6 +471,16 @@ fn decode_tcp(data: &[u8], meta: &mut PacketMeta, src: &str, dst: &str) {
         &[]
     };
 
+    // Store first 64 bytes of app payload as hex preview
+    if !app_payload.is_empty() {
+        let preview_len = app_payload.len().min(64);
+        meta.app_payload_preview = app_payload[..preview_len]
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .join("");
+    }
+
     if (src_port == 80 || dst_port == 80 || src_port == 8080 || dst_port == 8080)
         && !app_payload.is_empty()
     {
@@ -452,10 +491,195 @@ fn decode_tcp(data: &[u8], meta: &mut PacketMeta, src: &str, dst: &str) {
                 data: http,
             });
         }
+    } else if !app_payload.is_empty() {
+        // TLS detection: ContentType=0x16 (Handshake), major version=0x03
+        if app_payload.len() >= 5 && app_payload[0] == 0x16 && app_payload[1] == 0x03 {
+            if let Some(tls) = decode_tls_client_hello(app_payload) {
+                meta.protocol = "TLS".to_string();
+                meta.layers.application = Some(ApplicationLayer {
+                    protocol: "TLS".to_string(),
+                    data: tls,
+                });
+            }
+        }
     }
 }
 
-fn decode_udp(data: &[u8], meta: &mut PacketMeta, src: &str, dst: &str) {
+/// Detect and parse a TLS ClientHello from TCP payload.
+/// Returns JSON with SNI, JA3 components, cipher suites, extensions.
+fn decode_tls_client_hello(data: &[u8]) -> Option<serde_json::Value> {
+    // TLS record: ContentType(1) Version(2) Length(2) Handshake...
+    if data.len() < 9 {
+        return None;
+    }
+    // ContentType 0x16 = Handshake, Version 0x0301-0x0303
+    if data[0] != 0x16 || data[1] != 0x03 {
+        return None;
+    }
+    let record_len = u16::from_be_bytes([data[3], data[4]]) as usize;
+    if data.len() < 5 + record_len {
+        return None;
+    }
+    let handshake = &data[5..5 + record_len];
+    // HandshakeType 0x01 = ClientHello
+    if handshake.is_empty() || handshake[0] != 0x01 {
+        return None;
+    }
+    // Handshake body: Type(1) Length(3) Body...
+    if handshake.len() < 4 {
+        return None;
+    }
+    let body_len = ((handshake[1] as usize) << 16)
+        | ((handshake[2] as usize) << 8)
+        | handshake[3] as usize;
+    let body = &handshake[4..];
+    if body.len() < body_len || body_len < 34 {
+        return None;
+    }
+    let body = &body[..body_len];
+
+    let mut off = 0usize;
+    // legacy_version (2 bytes) - used for JA3 SSLVersion
+    if off + 2 > body.len() { return None; }
+    let legacy_version = u16::from_be_bytes([body[off], body[off + 1]]);
+    off += 2;
+    // random (32 bytes)
+    off += 32;
+    if off > body.len() { return None; }
+    // session_id length (1 byte) + session_id
+    if off >= body.len() { return None; }
+    let sid_len = body[off] as usize;
+    off += 1 + sid_len;
+    if off + 2 > body.len() { return None; }
+    // cipher_suites length (2 bytes)
+    let cs_len = u16::from_be_bytes([body[off], body[off + 1]]) as usize;
+    off += 2;
+    if off + cs_len > body.len() { return None; }
+    let cs_data = &body[off..off + cs_len];
+    let mut cipher_suites: Vec<u16> = cs_data.chunks(2)
+        .filter(|c| c.len() == 2)
+        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .filter(|&v| !is_grease(v))
+        .collect();
+    cipher_suites.sort_unstable();
+    off += cs_len;
+    // compression_methods length (1 byte) + methods
+    if off >= body.len() { return None; }
+    let cm_len = body[off] as usize;
+    off += 1 + cm_len;
+    if off + 2 > body.len() {
+        // No extensions — build minimal JA3
+        let ja3_str = format!("{},{},,,",
+            legacy_version,
+            cipher_suites.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("-")
+        );
+        let ja3_hash = format!("{:x}", md5::compute(ja3_str.as_bytes()));
+        return Some(serde_json::json!({
+            "type": "ClientHello",
+            "legacy_version": legacy_version,
+            "cipher_suites": cipher_suites,
+            "extensions": [],
+            "sni": null,
+            "supported_groups": [],
+            "ec_point_formats": [],
+            "ja3_string": ja3_str,
+            "ja3_hash": ja3_hash,
+        }));
+    }
+    // Extensions length (2 bytes)
+    let ext_total_len = u16::from_be_bytes([body[off], body[off + 1]]) as usize;
+    off += 2;
+    if off + ext_total_len > body.len() { return None; }
+    let ext_data = &body[off..off + ext_total_len];
+
+    let mut sni: Option<String> = None;
+    let mut ext_types: Vec<u16> = Vec::new();
+    let mut supported_groups: Vec<u16> = Vec::new();
+    let mut ec_point_formats: Vec<u8> = Vec::new();
+
+    let mut eoff = 0usize;
+    while eoff + 4 <= ext_data.len() {
+        let ext_type = u16::from_be_bytes([ext_data[eoff], ext_data[eoff + 1]]);
+        let ext_len = u16::from_be_bytes([ext_data[eoff + 2], ext_data[eoff + 3]]) as usize;
+        eoff += 4;
+        if eoff + ext_len > ext_data.len() { break; }
+        let ext_body = &ext_data[eoff..eoff + ext_len];
+        if !is_grease(ext_type) {
+            ext_types.push(ext_type);
+        }
+        match ext_type {
+            0x0000 => {
+                // SNI extension
+                if ext_body.len() >= 5 {
+                    let name_type = ext_body[2];
+                    if name_type == 0 {
+                        let name_len = u16::from_be_bytes([ext_body[3], ext_body[4]]) as usize;
+                        if ext_body.len() >= 5 + name_len {
+                            if let Ok(s) = std::str::from_utf8(&ext_body[5..5 + name_len]) {
+                                sni = Some(s.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            0x000A => {
+                // Supported Groups (elliptic_curves)
+                if ext_body.len() >= 2 {
+                    let groups_len = u16::from_be_bytes([ext_body[0], ext_body[1]]) as usize;
+                    let groups_data = &ext_body[2..];
+                    supported_groups = groups_data[..groups_len.min(groups_data.len())]
+                        .chunks(2)
+                        .filter(|c| c.len() == 2)
+                        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                        .filter(|&v| !is_grease(v))
+                        .collect();
+                }
+            }
+            0x000B => {
+                // EC Point Formats
+                if !ext_body.is_empty() {
+                    let fmt_len = ext_body[0] as usize;
+                    if ext_body.len() >= 1 + fmt_len {
+                        ec_point_formats = ext_body[1..1 + fmt_len].to_vec();
+                    }
+                }
+            }
+            _ => {}
+        }
+        eoff += ext_len;
+    }
+
+    let ja3_str = format!(
+        "{},{},{},{},{}",
+        legacy_version,
+        cipher_suites.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("-"),
+        ext_types.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("-"),
+        supported_groups.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("-"),
+        ec_point_formats.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("-"),
+    );
+    let ja3_hash = format!("{:x}", md5::compute(ja3_str.as_bytes()));
+
+    Some(serde_json::json!({
+        "type": "ClientHello",
+        "legacy_version": legacy_version,
+        "cipher_suites": cipher_suites,
+        "extensions": ext_types,
+        "sni": sni,
+        "supported_groups": supported_groups,
+        "ec_point_formats": ec_point_formats,
+        "ja3_string": ja3_str,
+        "ja3_hash": ja3_hash,
+    }))
+}
+
+fn is_grease(v: u16) -> bool {
+    // GREASE values: 0x?A?A pattern
+    let lo = (v & 0xFF) as u8;
+    let hi = ((v >> 8) & 0xFF) as u8;
+    lo == hi && lo & 0x0F == 0x0A
+}
+
+fn decode_udp(data: &[u8], meta: &mut PacketMeta, _src: &str, _dst: &str) {
     if data.len() < 8 {
         meta.protocol = "UDP".to_string();
         return;

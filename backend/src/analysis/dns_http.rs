@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use crate::parser::PacketMeta;
+use crate::analysis::utils::shannon_entropy;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsEntry {
@@ -14,6 +15,15 @@ pub struct DnsEntry {
     pub suspicious: bool,
     pub suspicious_reason: Option<String>,
     pub packet_index: usize,
+    // New fields
+    #[serde(default)]
+    pub entropy: f64,
+    #[serde(default)]
+    pub is_nxdomain: bool,
+    #[serde(default)]
+    pub ttl_min: Option<u32>,
+    #[serde(default)]
+    pub is_dga_candidate: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,9 +41,32 @@ pub struct HttpEntry {
     pub suspicious: bool,
     pub suspicious_reason: Option<String>,
     pub packet_index: usize,
+    // New fields
+    #[serde(default)]
+    pub content_type: Option<String>,
+    #[serde(default)]
+    pub body_preview: Option<String>,
+    #[serde(default)]
+    pub ua_category: Option<String>,
+    #[serde(default)]
+    pub is_ua_suspicious: bool,
 }
 
-const SUSPICIOUS_TLDS: &[&str] = &[".tk", ".xyz", ".ml", ".ga", ".cf", ".pw", ".top", ".click"];
+const SUSPICIOUS_TLDS: &[&str] = &[".tk", ".xyz", ".ml", ".ga", ".cf", ".pw", ".top", ".click", ".ru"];
+
+// Known-suspicious UA patterns
+const SUSPICIOUS_UA_PATTERNS: &[(&str, &str)] = &[
+    ("curl/", "Tool: curl"),
+    ("python-requests/", "Tool: Python requests"),
+    ("go-http-client/", "Tool: Go HTTP"),
+    ("nmap scripting", "Tool: Nmap"),
+    ("masscan/", "Tool: Masscan"),
+    ("nikto/", "Tool: Nikto"),
+    ("sqlmap/", "Tool: SQLMap"),
+    ("dirbuster/", "Tool: DirBuster"),
+    ("zgrab/", "Tool: ZGrab"),
+    ("gobuster/", "Tool: GoBuster"),
+];
 
 pub fn extract(packets: &[PacketMeta]) -> (Vec<DnsEntry>, Vec<HttpEntry>) {
     let mut dns_log = Vec::new();
@@ -77,7 +110,16 @@ fn parse_dns_entry(pkt: &PacketMeta, data: &serde_json::Value) -> Option<DnsEntr
         })
         .collect();
 
-    let (suspicious, suspicious_reason) = check_dns_suspicious(&name, &answer_strs, is_response);
+    // TTL from first answer
+    let ttl_min = answers.iter()
+        .filter_map(|a| a["ttl"].as_u64().map(|t| t as u32))
+        .min();
+
+    let is_nxdomain = is_response && answer_strs.is_empty() && !name.is_empty();
+    let entropy = shannon_entropy(&name);
+    let is_dga_candidate = check_dga_candidate(&name, entropy);
+
+    let (suspicious, suspicious_reason) = check_dns_suspicious(&name, &answer_strs, is_response, is_nxdomain, entropy);
 
     Some(DnsEntry {
         timestamp: pkt.timestamp,
@@ -91,22 +133,40 @@ fn parse_dns_entry(pkt: &PacketMeta, data: &serde_json::Value) -> Option<DnsEntr
         suspicious,
         suspicious_reason,
         packet_index: pkt.index,
+        entropy,
+        is_nxdomain,
+        ttl_min,
+        is_dga_candidate,
     })
 }
 
-fn check_dns_suspicious(name: &str, answers: &[String], is_response: bool) -> (bool, Option<String>) {
-    // Check suspicious TLDs
+fn check_dga_candidate(name: &str, entropy: f64) -> bool {
+    let labels: Vec<&str> = name.split('.').collect();
+    // Check longest label
+    for label in &labels[..labels.len().saturating_sub(1)] {
+        if label.len() >= 12 && entropy > 3.5 {
+            return true;
+        }
+        if label.len() > 20 {
+            let vowels = label.chars().filter(|c| "aeiou".contains(*c)).count();
+            if vowels < label.len() / 6 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn check_dns_suspicious(name: &str, answers: &[String], is_response: bool, is_nxdomain: bool, entropy: f64) -> (bool, Option<String>) {
     for tld in SUSPICIOUS_TLDS {
         if name.ends_with(tld) {
             return (true, Some(format!("Suspicious TLD: {}", tld)));
         }
     }
 
-    // DGA heuristic: very long random-looking labels (entropy check)
     let labels: Vec<&str> = name.split('.').collect();
     for label in &labels {
         if label.len() > 20 {
-            // Check if it looks random (high consonant clusters, no vowels)
             let vowels = label.chars().filter(|c| "aeiou".contains(*c)).count();
             if vowels < label.len() / 5 {
                 return (true, Some("Possible DGA domain (random-looking label)".to_string()));
@@ -114,8 +174,11 @@ fn check_dns_suspicious(name: &str, answers: &[String], is_response: bool) -> (b
         }
     }
 
-    // NXDOMAIN in answers
-    if is_response && answers.is_empty() {
+    if entropy > 3.8 && name.len() > 15 {
+        return (true, Some(format!("High Shannon entropy ({:.2}) — possible DGA", entropy)));
+    }
+
+    if is_nxdomain {
         return (true, Some("NXDOMAIN response — domain not found".to_string()));
     }
 
@@ -126,22 +189,25 @@ fn parse_http_entry(pkt: &PacketMeta, data: &serde_json::Value) -> Option<HttpEn
     let entry_type = data["type"].as_str()?.to_string();
     let headers = data["headers"].as_object();
 
-    let (method, host, path, status, user_agent) = match entry_type.as_str() {
+    let (method, host, path, status, user_agent, content_type) = match entry_type.as_str() {
         "request" => {
             let method = data["method"].as_str().map(|s| s.to_string());
             let uri = data["uri"].as_str().unwrap_or("").to_string();
             let host = headers.and_then(|h| h.get("Host")).and_then(|v| v.as_str()).map(|s| s.to_string());
             let ua = headers.and_then(|h| h.get("User-Agent")).and_then(|v| v.as_str()).map(|s| s.to_string());
-            (method, host, Some(uri), None, ua)
+            let ct = None;
+            (method, host, Some(uri), None, ua, ct)
         }
         "response" => {
             let status = data["status"].as_u64().map(|s| s as u16);
-            (None, None, None, status, None)
+            let ct = headers.and_then(|h| h.get("Content-Type")).and_then(|v| v.as_str()).map(|s| s.to_string());
+            (None, None, None, status, None, ct)
         }
         _ => return None,
     };
 
-    let (suspicious, suspicious_reason) = check_http_suspicious(data, headers);
+    let (ua_category, is_ua_suspicious) = categorize_ua(user_agent.as_deref());
+    let (suspicious, suspicious_reason) = check_http_suspicious(data, headers, is_ua_suspicious);
 
     Some(HttpEntry {
         timestamp: pkt.timestamp,
@@ -157,16 +223,45 @@ fn parse_http_entry(pkt: &PacketMeta, data: &serde_json::Value) -> Option<HttpEn
         suspicious,
         suspicious_reason,
         packet_index: pkt.index,
+        content_type,
+        body_preview: None,
+        ua_category,
+        is_ua_suspicious,
     })
 }
 
-fn check_http_suspicious(data: &serde_json::Value, headers: Option<&serde_json::Map<String, serde_json::Value>>) -> (bool, Option<String>) {
+fn categorize_ua(ua: Option<&str>) -> (Option<String>, bool) {
+    let ua = match ua {
+        Some(s) if !s.is_empty() => s.to_lowercase(),
+        _ => return (None, false),
+    };
+
+    for (pattern, category) in SUSPICIOUS_UA_PATTERNS {
+        if ua.contains(*pattern) {
+            return (Some(category.to_string()), true);
+        }
+    }
+
+    if ua.contains("mozilla") || ua.contains("chrome") || ua.contains("safari") || ua.contains("firefox") {
+        return (Some("Browser".to_string()), false);
+    }
+    if ua.contains("bot") || ua.contains("crawler") || ua.contains("spider") {
+        return (Some("Bot/Crawler".to_string()), true);
+    }
+
+    (Some("Unknown Client".to_string()), false)
+}
+
+fn check_http_suspicious(_data: &serde_json::Value, headers: Option<&serde_json::Map<String, serde_json::Value>>, is_ua_suspicious: bool) -> (bool, Option<String>) {
     if let Some(headers) = headers {
         if let Some(auth) = headers.get("Authorization") {
             if auth.as_str().unwrap_or("").starts_with("Basic ") {
                 return (true, Some("HTTP Basic Auth credentials in cleartext".to_string()));
             }
         }
+    }
+    if is_ua_suspicious {
+        return (true, Some("Suspicious User-Agent (tool/scanner)".to_string()));
     }
     (false, None)
 }

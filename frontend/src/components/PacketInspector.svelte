@@ -174,7 +174,7 @@
     width: min(780px, 92vw);
     height: 100vh;
     background: #161b22;
-    border-left: 1px solid #30363d;
+    border-left: 1px solid #2a2a2a;
     display: flex;
     flex-direction: column;
   }
@@ -246,7 +246,7 @@
   .detail-section {
     background: #0d1117;
     border: 1px solid #21262d;
-    border-radius: 6px;
+    border-radius: 2px;
     padding: 0.75rem;
   }
   .detail-label {

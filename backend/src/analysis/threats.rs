@@ -18,6 +18,13 @@ pub fn detect(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
     findings.extend(detect_port_scan(packets));
     findings.extend(detect_arp_spoofing(packets));
     findings.extend(detect_icmp_sweep(packets));
+    findings.extend(detect_icmp_ping_activity(packets));
+    findings.extend(detect_icmp_flood(packets));
+    findings.extend(detect_large_icmp(packets));
+    findings.extend(detect_udp_flood(packets));
+    findings.extend(detect_suspicious_ports(packets));
+    findings.extend(detect_telnet(packets));
+    findings.extend(detect_syn_flood(packets));
     findings.extend(detect_xmas_null_fin(packets));
     findings.extend(detect_beaconing(packets));
     findings.extend(detect_traffic_spikes(packets));
@@ -315,7 +322,7 @@ fn detect_traffic_spikes(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
         }
     }
 
-    let mean_bytes = if bytes_per_ip.is_empty() { 0.0 } else {
+    let _mean_bytes = if bytes_per_ip.is_empty() { 0.0 } else {
         total_bytes as f64 / bytes_per_ip.len() as f64
     };
 
@@ -420,4 +427,262 @@ fn is_private_ip(ip: &str) -> bool {
         }
     }
     false
+}
+
+fn detect_icmp_ping_activity(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
+    let mut pairs: HashMap<(String, String), Vec<usize>> = HashMap::new();
+
+    for pkt in packets {
+        if pkt.protocol == "ICMP" && pkt.info.contains("Echo Request") {
+            if let (Some(src), Some(dst)) = (&pkt.src_ip, &pkt.dst_ip) {
+                pairs.entry((src.clone(), dst.clone())).or_default().push(pkt.index);
+            }
+        }
+    }
+
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+
+    let unique_sources: std::collections::HashSet<&str> = pairs.keys().map(|(s, _)| s.as_str()).collect();
+    let unique_targets: std::collections::HashSet<&str> = pairs.keys().map(|(_, d)| d.as_str()).collect();
+    let total_requests: usize = pairs.values().map(|v| v.len()).sum();
+    let packet_indices: Vec<usize> = pairs.values().flatten().copied().take(50).collect();
+    let first_seen = packet_indices.iter()
+        .filter_map(|&i| packets.get(i).map(|p| p.timestamp))
+        .fold(f64::INFINITY, f64::min);
+
+    vec![ThreatFinding {
+        severity: "Info".to_string(),
+        category: "Reconnaissance".to_string(),
+        title: "ICMP Ping Activity Detected".to_string(),
+        description: format!(
+            "{} ICMP echo requests detected from {} source(s) to {} target(s). \
+            Ping activity may indicate network discovery or host availability scanning.",
+            total_requests, unique_sources.len(), unique_targets.len()
+        ),
+        first_seen,
+        packet_indices,
+    }]
+}
+
+fn detect_icmp_flood(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
+    let mut src_counts: HashMap<String, Vec<usize>> = HashMap::new();
+
+    for pkt in packets {
+        if pkt.protocol == "ICMP" && pkt.info.contains("Echo Request") {
+            if let Some(src) = &pkt.src_ip {
+                src_counts.entry(src.clone()).or_default().push(pkt.index);
+            }
+        }
+    }
+
+    let mut findings = Vec::new();
+    for (src, indices) in &src_counts {
+        if indices.len() > 50 {
+            let first_seen = indices.iter()
+                .filter_map(|&i| packets.get(i).map(|p| p.timestamp))
+                .fold(f64::INFINITY, f64::min);
+
+            findings.push(ThreatFinding {
+                severity: "High".to_string(),
+                category: "DoS".to_string(),
+                title: format!("ICMP Flood from {}", src),
+                description: format!(
+                    "{} sent {} ICMP echo requests, which exceeds the flood threshold of 50. \
+                    This volume of ping traffic may indicate a denial-of-service attack or aggressive \
+                    network scanning.",
+                    src, indices.len()
+                ),
+                first_seen,
+                packet_indices: indices.iter().copied().take(50).collect(),
+            });
+        }
+    }
+    findings
+}
+
+fn detect_large_icmp(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
+    let large: Vec<usize> = packets.iter()
+        .filter(|p| p.protocol == "ICMP" && p.length > 1024)
+        .map(|p| p.index)
+        .collect();
+
+    if large.is_empty() {
+        return Vec::new();
+    }
+
+    let first_seen = large.iter()
+        .filter_map(|&i| packets.get(i).map(|p| p.timestamp))
+        .fold(f64::INFINITY, f64::min);
+
+    vec![ThreatFinding {
+        severity: "Medium".to_string(),
+        category: "Exfiltration".to_string(),
+        title: "Oversized ICMP Packets Detected".to_string(),
+        description: format!(
+            "{} ICMP packet(s) exceeding 1024 bytes detected. Unusually large ICMP packets \
+            can be used to exfiltrate data via covert channel or as part of a Ping of Death attack.",
+            large.len()
+        ),
+        first_seen,
+        packet_indices: large.into_iter().take(50).collect(),
+    }]
+}
+
+fn detect_udp_flood(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
+    let mut src_counts: HashMap<String, Vec<usize>> = HashMap::new();
+
+    for pkt in packets {
+        if pkt.protocol == "UDP" {
+            if let Some(src) = &pkt.src_ip {
+                src_counts.entry(src.clone()).or_default().push(pkt.index);
+            }
+        }
+    }
+
+    let mut findings = Vec::new();
+    for (src, indices) in &src_counts {
+        if indices.len() > 500 {
+            let first_seen = indices.iter()
+                .filter_map(|&i| packets.get(i).map(|p| p.timestamp))
+                .fold(f64::INFINITY, f64::min);
+
+            findings.push(ThreatFinding {
+                severity: "Medium".to_string(),
+                category: "DoS".to_string(),
+                title: format!("UDP Flood from {}", src),
+                description: format!(
+                    "{} sent {} UDP packets, exceeding the flood threshold of 500. \
+                    High-rate UDP traffic from a single source is a common indicator of \
+                    a UDP-based denial-of-service attack.",
+                    src, indices.len()
+                ),
+                first_seen,
+                packet_indices: indices.iter().copied().take(50).collect(),
+            });
+        }
+    }
+    findings
+}
+
+fn detect_suspicious_ports(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
+    let suspicious: &[(u16, &str, &str, &str)] = &[
+        (4444,  "Critical", "Malware",           "Metasploit default handler"),
+        (31337, "Critical", "Malware",            "Back Orifice / elite hacking"),
+        (12345, "Critical", "Malware",            "NetBus trojan"),
+        (6666,  "High",     "Command & Control",  "IRC (common botnet C2)"),
+        (6667,  "High",     "Command & Control",  "IRC (common botnet C2)"),
+        (1337,  "High",     "Malware",            "Common backdoor port"),
+    ];
+
+    let mut findings = Vec::new();
+    for &(port, severity, category, label) in suspicious {
+        let matched: Vec<usize> = packets.iter()
+            .filter(|p| p.dst_port == Some(port) || p.src_port == Some(port))
+            .map(|p| p.index)
+            .collect();
+
+        if matched.is_empty() {
+            continue;
+        }
+
+        let first_seen = matched.iter()
+            .filter_map(|&i| packets.get(i).map(|p| p.timestamp))
+            .fold(f64::INFINITY, f64::min);
+
+        findings.push(ThreatFinding {
+            severity: severity.to_string(),
+            category: category.to_string(),
+            title: format!("Suspicious Port {} Traffic ({})", port, label),
+            description: format!(
+                "{} packet(s) detected on port {} ({}) — a port historically associated with \
+                malware, remote access trojans, or command-and-control infrastructure. \
+                Investigate the endpoints involved.",
+                matched.len(), port, label
+            ),
+            first_seen,
+            packet_indices: matched.into_iter().take(50).collect(),
+        });
+    }
+    findings
+}
+
+fn detect_telnet(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
+    let matched: Vec<usize> = packets.iter()
+        .filter(|p| p.dst_port == Some(23) || p.src_port == Some(23))
+        .map(|p| p.index)
+        .collect();
+
+    if matched.is_empty() {
+        return Vec::new();
+    }
+
+    let first_seen = matched.iter()
+        .filter_map(|&i| packets.get(i).map(|p| p.timestamp))
+        .fold(f64::INFINITY, f64::min);
+
+    vec![ThreatFinding {
+        severity: "High".to_string(),
+        category: "Cleartext Protocol".to_string(),
+        title: "Telnet Traffic Detected (Port 23)".to_string(),
+        description: format!(
+            "{} packet(s) observed on Telnet port 23. Telnet transmits all data including \
+            credentials in plaintext, making it trivially interceptable. \
+            Modern environments should use SSH instead.",
+            matched.len()
+        ),
+        first_seen,
+        packet_indices: matched.into_iter().take(50).collect(),
+    }]
+}
+
+fn detect_syn_flood(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
+    let mut syn_counts: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut synack_received: HashMap<String, usize> = HashMap::new();
+
+    for pkt in packets {
+        if pkt.protocol != "TCP" { continue; }
+        if let Some(layers) = &pkt.layers.transport {
+            if let Some(flags) = &layers.flags {
+                if flags.contains("SYN") && !flags.contains("ACK") {
+                    if let Some(src) = &pkt.src_ip {
+                        syn_counts.entry(src.clone()).or_default().push(pkt.index);
+                    }
+                }
+                if flags.contains("SYN") && flags.contains("ACK") {
+                    if let Some(dst) = &pkt.dst_ip {
+                        *synack_received.entry(dst.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut findings = Vec::new();
+    for (src, indices) in &syn_counts {
+        if indices.len() <= 200 { continue; }
+        let responses = synack_received.get(src).copied().unwrap_or(0);
+        // Flood if SYNs >> SYN-ACKs (handshakes rarely completed)
+        if responses < indices.len() / 10 {
+            let first_seen = indices.iter()
+                .filter_map(|&i| packets.get(i).map(|p| p.timestamp))
+                .fold(f64::INFINITY, f64::min);
+
+            findings.push(ThreatFinding {
+                severity: "Critical".to_string(),
+                category: "DoS".to_string(),
+                title: format!("SYN Flood from {}", src),
+                description: format!(
+                    "{} sent {} TCP SYN packets with only {} SYN-ACK responses received, \
+                    indicating handshakes are not completing. This is a strong indicator of \
+                    a SYN flood denial-of-service attack designed to exhaust server connection tables.",
+                    src, indices.len(), responses
+                ),
+                first_seen,
+                packet_indices: indices.iter().copied().take(50).collect(),
+            });
+        }
+    }
+    findings
 }

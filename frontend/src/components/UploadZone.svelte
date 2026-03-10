@@ -16,6 +16,9 @@
     processFile(file);
   }
 
+  let sizeWarning = '';
+  const SIZE_WARN_MB = 500;
+
   function processFile(file) {
     if (!file) return;
     if (!file.name.endsWith('.pcap') && !file.name.endsWith('.pcapng')) {
@@ -23,6 +26,12 @@
       return;
     }
     error = '';
+    const sizeMB = file.size / 1_048_576;
+    if (sizeMB > SIZE_WARN_MB) {
+      sizeWarning = `⚠ Large file (${sizeMB.toFixed(0)} MB). Analysis may take several minutes.`;
+    } else {
+      sizeWarning = '';
+    }
     uploadFile(file);
   }
 </script>
@@ -45,6 +54,9 @@
     Browse files
     <input type="file" accept=".pcap,.pcapng" on:change={handlePick} hidden />
   </label>
+  {#if sizeWarning}
+    <p class="size-warn">{sizeWarning}</p>
+  {/if}
   {#if error}
     <p class="error">{error}</p>
   {/if}
@@ -52,9 +64,9 @@
 
 <style>
   .zone {
-    width: min(560px, 90vw);
-    border: 2px dashed #30363d;
-    border-radius: 12px;
+    width: min(480px, 90vw);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 2px;
     padding: 3rem 2rem;
     display: flex;
     flex-direction: column;
@@ -62,35 +74,48 @@
     gap: 0.75rem;
     cursor: pointer;
     transition: border-color 0.2s, background 0.2s;
-    color: #8b949e;
+    color: #404040;
+    background: #0a0a0a;
   }
   .zone.dragging {
-    border-color: #58a6ff;
-    background: rgba(88, 166, 255, 0.06);
-    color: #58a6ff;
+    border-color: rgba(255,255,255,0.2);
+    background: rgba(255,255,255,0.02);
+    color: #c8d8f0;
   }
   .hint {
-    font-size: 0.95rem;
+    font-size: 0.85rem;
+    color: #505050;
+    letter-spacing: 0.02em;
   }
   .or {
-    font-size: 0.8rem;
-    color: #484f58;
+    font-size: 0.75rem;
+    color: #303030;
   }
   .btn {
-    padding: 0.5rem 1.25rem;
-    background: #21262d;
-    border: 1px solid #30363d;
-    border-radius: 6px;
-    color: #e6edf3;
-    font-size: 0.875rem;
+    padding: 0.5rem 1.5rem;
+    background: transparent;
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 2px;
+    color: #c0c0c0;
+    font-size: 0.78rem;
+    font-family: 'Inter', sans-serif;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
     cursor: pointer;
-    transition: background 0.15s;
+    transition: color 0.15s, border-color 0.15s, background 0.15s;
   }
   .btn:hover {
-    background: #292e36;
+    color: #f0f0f0;
+    border-color: rgba(255,255,255,0.25);
+    background: rgba(255,255,255,0.04);
   }
   .error {
-    color: #f85149;
-    font-size: 0.85rem;
+    color: #e03e5a;
+    font-size: 0.82rem;
+  }
+  .size-warn {
+    color: #c8920a;
+    font-size: 0.78rem;
+    text-align: center;
   }
 </style>

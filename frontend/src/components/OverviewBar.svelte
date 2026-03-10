@@ -1,9 +1,11 @@
 <script>
+  import { onMount } from 'svelte';
   export let result;
 
   $: overview = result?.overview || {};
   $: threats = result?.threats || [];
   $: protocols = result?.protocol_stats || [];
+  $: sizeStats = result?.packet_size_stats || {};
 
   $: highestSev = (() => {
     for (const t of threats) {
@@ -34,83 +36,145 @@
     return `${(d / 3600).toFixed(2)}h`;
   })();
 
+  function fmtBytes(b) {
+    if (!b) return '0 B';
+    if (b >= 1073741824) return (b / 1073741824).toFixed(2) + ' GB';
+    if (b >= 1048576) return (b / 1048576).toFixed(2) + ' MB';
+    if (b >= 1024) return (b / 1024).toFixed(1) + ' KB';
+    return b + ' B';
+  }
+
   const sevColor = {
-    Critical: '#f85149',
-    High: '#e3b341',
-    Medium: '#d29922',
-    Info: '#8b949e',
-    None: '#3fb950',
+    Critical: '#e03e5a',
+    High: '#ffb700',
+    Medium: '#c8d8f0',
+    Info: '#606060',
+    None: '#4ade80',
   };
+
+  // Animated count-up
+  let displayValues = {};
+  let animFrame;
+
+  $: stats = [
+    { key: 'packets', label: 'Total Packets', raw: overview.total_packets || 0, fmt: v => Math.round(v).toLocaleString() },
+    { key: 'duration', label: 'Duration', raw: null, fmt: () => duration },
+    { key: 'ips', label: 'Unique IPs', raw: uniqueIps, fmt: v => Math.round(v).toLocaleString() },
+    { key: 'protocols', label: 'Protocols', raw: protocols.length, fmt: v => Math.round(v) },
+    { key: 'threats', label: 'Threats Found', raw: threats.length, fmt: v => Math.round(v) },
+    { key: 'bytes', label: 'Total Bytes', raw: Number(sizeStats.total_bytes) || 0, fmt: v => fmtBytes(Math.round(v)) },
+    { key: 'avgsize', label: 'Avg Packet Size', raw: sizeStats.avg || 0, fmt: v => Math.round(v) + ' B' },
+  ];
+
+  function animateTo(targets) {
+    if (animFrame) cancelAnimationFrame(animFrame);
+    const start = performance.now();
+    const duration_ms = 1200;
+
+    const startVals = {};
+    for (const s of targets) {
+      startVals[s.key] = 0;
+    }
+
+    function ease(t) {
+      return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+    }
+
+    function step(now) {
+      const elapsed = now - start;
+      const t = Math.min(elapsed / duration_ms, 1);
+      const e = ease(t);
+      const next = {};
+      for (const s of targets) {
+        if (s.raw === null) {
+          next[s.key] = s.fmt(0);
+        } else {
+          next[s.key] = s.fmt(s.raw * e);
+        }
+      }
+      displayValues = next;
+      if (t < 1) {
+        animFrame = requestAnimationFrame(step);
+      }
+    }
+    animFrame = requestAnimationFrame(step);
+  }
+
+  $: if (stats.length) animateTo(stats);
 </script>
 
 <div class="overview-bar">
-  <div class="stat-card">
-    <div class="label">Total Packets</div>
-    <div class="value">{(overview.total_packets || 0).toLocaleString()}</div>
-  </div>
-  <div class="stat-card">
-    <div class="label">Duration</div>
-    <div class="value">{duration}</div>
-  </div>
-  <div class="stat-card">
-    <div class="label">Unique IPs</div>
-    <div class="value">{uniqueIps.toLocaleString()}</div>
-  </div>
-  <div class="stat-card">
-    <div class="label">Protocols</div>
-    <div class="value">{protocols.length}</div>
-  </div>
-  <div class="stat-card">
-    <div class="label">Threats Found</div>
-    <div class="value threat-row">
-      {threats.length}
-      {#if threats.length > 0}
-        <span class="sev-badge" style="background: {sevColor[highestSev]}22; color: {sevColor[highestSev]}; border-color: {sevColor[highestSev]}44">
-          {highestSev}
-        </span>
-      {/if}
+  {#each stats as s}
+    <div class="stat-card" class:critical={s.key === 'threats' && highestSev === 'Critical'}>
+      <div class="label">{s.label}</div>
+      <div class="value">
+        {displayValues[s.key] ?? (s.raw === null ? s.fmt(0) : '0')}
+        {#if s.key === 'threats' && threats.length > 0}
+          <span class="sev-badge" class:pulse-critical={highestSev === 'Critical'}
+            style="background: {sevColor[highestSev]}22; color: {sevColor[highestSev]}; border-color: {sevColor[highestSev]}55">
+            {highestSev}
+          </span>
+        {/if}
+      </div>
     </div>
-  </div>
+  {/each}
 </div>
 
 <style>
   .overview-bar {
     display: flex;
-    gap: 0.75rem;
+    gap: 0.6rem;
     margin-bottom: 1rem;
     flex-wrap: wrap;
   }
   .stat-card {
     flex: 1;
-    min-width: 120px;
-    background: #161b22;
-    border: 1px solid #21262d;
-    border-radius: 8px;
-    padding: 1rem 1.25rem;
+    min-width: 110px;
+    background: #111111;
+    border: 1px solid rgba(200, 216, 240, 0.18);
+    
+    border-radius: 2px;
+    padding: 0.9rem 1.1rem;
+    transition: box-shadow 0.3s;
+  }
+  .stat-card:hover {
+    
+  }
+  .stat-card.critical {
+    border-color: rgba(255,32,121,0.4);
+    
   }
   .label {
-    font-size: 0.75rem;
-    color: #8b949e;
+    font-size: 0.7rem;
+    color: #606060;
     text-transform: uppercase;
-    letter-spacing: 0.05em;
+    letter-spacing: 0.06em;
     margin-bottom: 0.4rem;
   }
   .value {
-    font-size: 1.5rem;
-    font-weight: 600;
-    color: #e6edf3;
-  }
-  .threat-row {
+    font-size: 1.4rem;
+    font-weight: 700;
+    color: #4ade80;
+    
     display: flex;
     align-items: center;
     gap: 0.5rem;
+    flex-wrap: wrap;
   }
   .sev-badge {
-    font-size: 0.7rem;
-    font-weight: 600;
+    font-size: 0.65rem;
+    font-weight: 700;
     padding: 0.15rem 0.5rem;
     border-radius: 999px;
     border: 1px solid;
-    letter-spacing: 0.04em;
+    letter-spacing: 0.05em;
+    text-shadow: none;
+  }
+  .pulse-critical {
+    animation: pulse-critical 1.5s ease-in-out infinite;
+  }
+  @keyframes pulse-critical {
+    0%, 100% {  }
+    50%       {  }
   }
 </style>
