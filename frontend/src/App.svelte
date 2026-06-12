@@ -1,5 +1,6 @@
 <script>
-  import { activeResult, activeSessionId, loading, uploadProgress, uploadError, inspectorOpen } from './stores/session.js';
+  import { onMount } from 'svelte';
+  import { activeResult, activeSessionId, loading, uploadProgress, uploadError, inspectorOpen, loadSession } from './stores/session.js';
   import { clearInvestigation } from './stores/investigation.js';
 
   import UploadZone from './components/UploadZone.svelte';
@@ -28,6 +29,12 @@
   let activeTab = 0;
   let settingsOpen = false;
   let sidebarCollapsed = false;
+
+  // Allow bookmarking/sharing a session: /?session=<id> opens it directly
+  onMount(() => {
+    const sid = new URLSearchParams(window.location.search).get('session');
+    if (sid) loadSession(sid);
+  });
 
   $: result = $activeResult;
 

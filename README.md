@@ -2,6 +2,8 @@
 
 A local .pcap file analysis tool with a blue team security focus. Drop a capture file in the browser, get a SOC-style dashboard with threat detections, suspicious conversation scoring, traffic timeline, geo map, DNS/HTTP/TLS logs, and packet inspection — all running offline on your machine.
 
+![PcapSentry triage dashboard](docs/screenshot.png)
+
 ## Prerequisites
 
 - **Rust** (stable) — https://rustup.rs
@@ -48,7 +50,7 @@ PcapSentry must be run from the `backend/` directory so it can locate the `../fr
 4. The dashboard loads with 13 modules: **Triage**, **Alerts**, **Conversations** (suspicious conversations scored by joined alert/beaconing/TLS signals), **Flows**, **DNS**, **HTTP**, **TLS**, **IOC**, **Geo**, **Stats**, **Timeline**, **Packets**, and **Notes**
 5. Click any finding to isolate its packets in the Packet Inspector; TCP streams can be reassembled and viewed inline
 6. "Export PDF" generates a report; CSV export is available per module
-7. Sessions are saved to disk and reappear in the left sidebar after a restart
+7. Sessions are saved to disk and reappear in the left sidebar after a restart; a session can be opened directly via `http://localhost:7777/?session=<id>`
 8. Alert thresholds, IP/domain whitelists, and optional VirusTotal/Shodan API keys are configurable in the Settings panel
 
 ## Supported Captures
