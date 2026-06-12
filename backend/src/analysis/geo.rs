@@ -1,7 +1,7 @@
 use std::net::IpAddr;
-use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use crate::parser::PacketMeta;
+use crate::analysis::utils::is_private_addr;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeoPoint {
@@ -15,23 +15,54 @@ pub struct GeoPoint {
     pub bytes: usize,
 }
 
-pub fn geolocate(packets: &[PacketMeta]) -> Vec<GeoPoint> {
-    let db_path = "../assets/GeoLite2-City.mmdb";
+// Locate the MaxMind DB. Search relative to the running executable so the
+// binary works no matter what directory the user invokes it from, then fall
+// back to the legacy CWD-relative path.
+fn locate_geoip_db() -> Option<std::path::PathBuf> {
+    let candidates: Vec<std::path::PathBuf> = std::env::current_exe()
+        .ok()
+        .into_iter()
+        .flat_map(|exe| {
+            let mut v = Vec::new();
+            // target/release/pcapsentry → ../../../assets/GeoLite2-City.mmdb
+            if let Some(p) = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
+                v.push(p.join("assets").join("GeoLite2-City.mmdb"));
+            }
+            // sibling assets dir (when installed)
+            if let Some(p) = exe.parent() {
+                v.push(p.join("assets").join("GeoLite2-City.mmdb"));
+            }
+            v
+        })
+        .chain(std::iter::once(std::path::PathBuf::from("../assets/GeoLite2-City.mmdb")))
+        .chain(std::iter::once(std::path::PathBuf::from("assets/GeoLite2-City.mmdb")))
+        .collect();
+    candidates.into_iter().find(|p| p.exists())
+}
 
-    let reader = match maxminddb::Reader::open_readfile(db_path) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Warning: Could not open GeoLite2 database: {}", e);
+pub fn geolocate(packets: &[PacketMeta]) -> Vec<GeoPoint> {
+    let db_path = match locate_geoip_db() {
+        Some(p) => p,
+        None => {
+            eprintln!("Warning: GeoLite2-City.mmdb not found in any search path.");
             return Vec::new();
         }
     };
 
-    let mut ip_stats: std::collections::HashMap<String, (usize, usize)> = std::collections::HashMap::new();
+    let reader = match maxminddb::Reader::open_readfile(&db_path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Warning: Could not open GeoLite2 database at {}: {}", db_path.display(), e);
+            return Vec::new();
+        }
+    };
+
+    let mut ip_stats: std::collections::HashMap<IpAddr, (usize, usize)> = std::collections::HashMap::new();
 
     for pkt in packets {
-        for ip in [&pkt.src_ip, &pkt.dst_ip].into_iter().flatten() {
-            if !is_private_ip(ip) {
-                let entry = ip_stats.entry(ip.clone()).or_insert((0, 0));
+        for ip in [pkt.src_ip, pkt.dst_ip].into_iter().flatten() {
+            if !is_private_addr(&ip) {
+                let entry = ip_stats.entry(ip).or_insert((0, 0));
                 entry.0 += 1;
                 entry.1 += pkt.length;
             }
@@ -39,11 +70,8 @@ pub fn geolocate(packets: &[PacketMeta]) -> Vec<GeoPoint> {
     }
 
     let mut points = Vec::new();
-    for (ip, (packet_count, bytes)) in &ip_stats {
-        let addr = match IpAddr::from_str(ip) {
-            Ok(a) => a,
-            Err(_) => continue,
-        };
+    for (addr, (packet_count, bytes)) in &ip_stats {
+        let addr = *addr;
 
         let record: Result<maxminddb::geoip2::City, _> = reader.lookup(addr);
         if let Ok(city) = record {
@@ -66,7 +94,7 @@ pub fn geolocate(packets: &[PacketMeta]) -> Vec<GeoPoint> {
 
             if lat != 0.0 || lon != 0.0 {
                 points.push(GeoPoint {
-                    ip: ip.clone(),
+                    ip: addr.to_string(),
                     lat,
                     lon,
                     country,
@@ -82,22 +110,3 @@ pub fn geolocate(packets: &[PacketMeta]) -> Vec<GeoPoint> {
     points
 }
 
-fn is_private_ip(ip: &str) -> bool {
-    if ip.starts_with("10.") || ip.starts_with("192.168.") || ip == "127.0.0.1" || ip.starts_with("169.254.") {
-        return true;
-    }
-    if let Some(rest) = ip.strip_prefix("172.") {
-        if let Some(second) = rest.split('.').next() {
-            if let Ok(n) = second.parse::<u8>() {
-                if (16..=31).contains(&n) {
-                    return true;
-                }
-            }
-        }
-    }
-    // IPv6 loopback/link-local
-    if ip == "::1" || ip.starts_with("fe80:") {
-        return true;
-    }
-    false
-}

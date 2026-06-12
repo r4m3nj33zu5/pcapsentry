@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::net::IpAddr;
 use serde::{Deserialize, Serialize};
-use crate::parser::PacketMeta;
+use crate::analysis::indexed::IndexedView;
+use crate::analysis::utils::is_private_addr;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreatFinding {
@@ -12,23 +14,36 @@ pub struct ThreatFinding {
     pub packet_indices: Vec<usize>,
 }
 
-pub fn detect(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
+pub fn detect(view: &IndexedView, thresholds: &crate::config::AlertThresholds, whitelist: &crate::config::Whitelist) -> Vec<ThreatFinding> {
     let mut findings = Vec::new();
 
-    findings.extend(detect_port_scan(packets));
-    findings.extend(detect_arp_spoofing(packets));
-    findings.extend(detect_icmp_sweep(packets));
-    findings.extend(detect_icmp_ping_activity(packets));
-    findings.extend(detect_icmp_flood(packets));
-    findings.extend(detect_large_icmp(packets));
-    findings.extend(detect_udp_flood(packets));
-    findings.extend(detect_suspicious_ports(packets));
-    findings.extend(detect_telnet(packets));
-    findings.extend(detect_syn_flood(packets));
-    findings.extend(detect_xmas_null_fin(packets));
-    findings.extend(detect_beaconing(packets));
-    findings.extend(detect_traffic_spikes(packets));
-    findings.extend(detect_cleartext_credentials(packets));
+    findings.extend(detect_port_scan(view, thresholds));
+    findings.extend(detect_arp_spoofing(view));
+    findings.extend(detect_icmp_sweep(view));
+    findings.extend(detect_icmp_ping_activity(view));
+    findings.extend(detect_icmp_flood(view, thresholds));
+    findings.extend(detect_large_icmp(view));
+    findings.extend(detect_udp_flood(view, thresholds));
+    findings.extend(detect_suspicious_ports(view));
+    findings.extend(detect_telnet(view));
+    findings.extend(detect_syn_flood(view, thresholds));
+    findings.extend(detect_xmas_null_fin(view));
+    findings.extend(detect_beaconing(view, thresholds));
+    findings.extend(detect_traffic_spikes(view, thresholds));
+    findings.extend(detect_cleartext_credentials(view));
+
+    // Apply whitelist via post-filter on the title — the legacy threats
+    // schema doesn't carry an explicit affected_hosts list. Drop any finding
+    // whose title contains a whitelisted IP. Comparing parsed IpAddr avoids
+    // "::1" vs "0:0:0:0:0:0:0:1" formatting drift.
+    if !whitelist.ips.is_empty() {
+        let wl: std::collections::HashSet<IpAddr> = whitelist.ips.iter()
+            .filter_map(|s| s.parse().ok()).collect();
+        findings.retain(|f| {
+            !wl.iter().any(|ip| f.title.contains(&ip.to_string())
+                || f.description.contains(&ip.to_string()))
+        });
+    }
 
     // Sort by severity
     let sev_order = |s: &str| match s {
@@ -41,32 +56,26 @@ pub fn detect(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
     findings
 }
 
-fn detect_port_scan(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
-    // Track SYN packets per source: dst_ip -> set of ports
-    // Finding: one src sends SYN to many distinct dst_ports with few SYN-ACK responses
-    let mut syn_map: HashMap<String, HashMap<String, Vec<(u16, usize)>>> = HashMap::new();
-    let mut synack_map: HashMap<String, usize> = HashMap::new();
+fn detect_port_scan(view: &IndexedView, thresholds: &crate::config::AlertThresholds) -> Vec<ThreatFinding> {
+    let mut syn_map: HashMap<IpAddr, HashMap<IpAddr, Vec<(u16, usize)>>> = HashMap::new();
+    let mut synack_map: HashMap<IpAddr, usize> = HashMap::new();
+    let mut first_seen_map: HashMap<IpAddr, f64> = HashMap::new();
 
-    for pkt in packets {
-        if pkt.protocol != "TCP" { continue; }
-        if let Some(layers) = &pkt.layers.transport {
-            if let Some(flags) = &layers.flags {
-                let src = pkt.src_ip.clone().unwrap_or_default();
-                let dst = pkt.dst_ip.clone().unwrap_or_default();
-                let dst_port = pkt.dst_port.unwrap_or(0);
-
-                if flags.contains("SYN") && !flags.contains("ACK") {
-                    syn_map
-                        .entry(src.clone())
-                        .or_default()
-                        .entry(dst.clone())
-                        .or_default()
-                        .push((dst_port, pkt.index));
-                }
-                if flags.contains("SYN") && flags.contains("ACK") {
-                    *synack_map.entry(dst.clone()).or_insert(0) += 1;
-                }
-            }
+    for &i in &view.tcp_syn {
+        let pkt = &view.packets[i];
+        let (src, dst) = match (pkt.src_ip, pkt.dst_ip) {
+            (Some(s), Some(d)) => (s, d),
+            _ => continue,
+        };
+        let dst_port = pkt.dst_port.unwrap_or(0);
+        syn_map.entry(src).or_default().entry(dst).or_default().push((dst_port, pkt.index));
+        let fs = first_seen_map.entry(src).or_insert(f64::INFINITY);
+        if pkt.timestamp < *fs { *fs = pkt.timestamp; }
+    }
+    for &i in &view.tcp_synack {
+        let pkt = &view.packets[i];
+        if let Some(dst) = pkt.dst_ip {
+            *synack_map.entry(dst).or_insert(0) += 1;
         }
     }
 
@@ -77,11 +86,10 @@ fn detect_port_scan(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
         let synacks = synack_map.get(src).copied().unwrap_or(0);
 
         // Port scan: many SYNs, few SYN-ACKs back
-        if total_ports >= 20 && synacks < total_ports / 5 {
+        if total_ports >= thresholds.port_scan_syn_minimum && synacks < (total_ports as f64 * thresholds.port_scan_response_ratio) as usize {
             let packet_indices: Vec<usize> = dst_map.values().flatten().map(|(_, i)| *i).take(100).collect();
-            let first_seen = packet_indices.iter()
-                .filter_map(|&i| packets.get(i).map(|p| p.timestamp))
-                .fold(f64::INFINITY, f64::min);
+            let first_seen = first_seen_map.get(src).copied().unwrap_or(f64::INFINITY);
+            let first_seen = if first_seen.is_finite() { first_seen } else { 0.0 };
 
             findings.push(ThreatFinding {
                 severity: if total_ports > 100 { "Critical".to_string() } else { "High".to_string() },
@@ -100,24 +108,23 @@ fn detect_port_scan(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
     findings
 }
 
-fn detect_icmp_sweep(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
-    let mut icmp_sources: HashMap<String, Vec<(String, usize)>> = HashMap::new();
+fn detect_icmp_sweep(view: &IndexedView) -> Vec<ThreatFinding> {
+    let mut icmp_sources: HashMap<IpAddr, Vec<(IpAddr, usize)>> = HashMap::new();
 
-    for pkt in packets {
-        if pkt.protocol == "ICMP" {
-            if let (Some(src), Some(dst)) = (&pkt.src_ip, &pkt.dst_ip) {
-                icmp_sources.entry(src.clone()).or_default().push((dst.clone(), pkt.index));
-            }
+    for &i in &view.icmp {
+        let pkt = &view.packets[i];
+        if let (Some(src), Some(dst)) = (pkt.src_ip, pkt.dst_ip) {
+            icmp_sources.entry(src).or_default().push((dst, pkt.index));
         }
     }
 
     let mut findings = Vec::new();
     for (src, targets) in &icmp_sources {
-        let unique_targets: std::collections::HashSet<&String> = targets.iter().map(|(ip, _)| ip).collect();
+        let unique_targets: std::collections::HashSet<&IpAddr> = targets.iter().map(|(ip, _)| ip).collect();
         if unique_targets.len() >= 10 {
             let packet_indices: Vec<usize> = targets.iter().map(|(_, i)| *i).take(50).collect();
             let first_seen = packet_indices.iter()
-                .filter_map(|&i| packets.get(i).map(|p| p.timestamp))
+                .filter_map(|&i| view.packets.get(i).map(|p| p.timestamp))
                 .fold(f64::INFINITY, f64::min);
 
             findings.push(ThreatFinding {
@@ -137,26 +144,20 @@ fn detect_icmp_sweep(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
     findings
 }
 
-fn detect_xmas_null_fin(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
-    let mut xmas_packets: Vec<(String, usize, f64)> = Vec::new();
-    let mut null_packets: Vec<(String, usize, f64)> = Vec::new();
-    let mut fin_packets: Vec<(String, usize, f64)> = Vec::new();
+fn detect_xmas_null_fin(view: &IndexedView) -> Vec<ThreatFinding> {
+    let mut xmas_packets: Vec<(IpAddr, usize, f64)> = Vec::new();
+    let mut null_packets: Vec<(IpAddr, usize, f64)> = Vec::new();
+    let mut fin_packets: Vec<(IpAddr, usize, f64)> = Vec::new();
 
-    for pkt in packets {
-        if pkt.protocol != "TCP" { continue; }
-        if let Some(layers) = &pkt.layers.transport {
-            if let Some(flags) = &layers.flags {
-                let src = pkt.src_ip.clone().unwrap_or_default();
-                if flags.contains("FIN") && flags.contains("PSH") && flags.contains("URG") {
-                    xmas_packets.push((src, pkt.index, pkt.timestamp));
-                } else if flags == "NONE" {
-                    null_packets.push((src, pkt.index, pkt.timestamp));
-                } else if flags == "FIN" {
-                    fin_packets.push((src, pkt.index, pkt.timestamp));
-                }
-            }
+    let push = |bucket: &mut Vec<(IpAddr, usize, f64)>, i: usize| {
+        let pkt = &view.packets[i];
+        if let Some(src) = pkt.src_ip {
+            bucket.push((src, pkt.index, pkt.timestamp));
         }
-    }
+    };
+    for &i in &view.tcp_xmas { push(&mut xmas_packets, i); }
+    for &i in &view.tcp_null { push(&mut null_packets, i); }
+    for &i in &view.tcp_fin_only { push(&mut fin_packets, i); }
 
     let mut findings = Vec::new();
 
@@ -208,21 +209,15 @@ fn detect_xmas_null_fin(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
     findings
 }
 
-fn detect_arp_spoofing(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
-    // Track IP -> set of MACs seen in ARP replies
+fn detect_arp_spoofing(view: &IndexedView) -> Vec<ThreatFinding> {
     let mut ip_mac_map: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
     let mut ip_mac_packets: HashMap<String, Vec<usize>> = HashMap::new();
 
-    for pkt in packets {
-        if pkt.protocol != "ARP" { continue; }
+    for &i in &view.arp_reply {
+        let pkt = &view.packets[i];
         if let Some(arp) = &pkt.layers.arp {
-            if arp.operation == "Reply" {
-                ip_mac_map
-                    .entry(arp.sender_ip.clone())
-                    .or_default()
-                    .insert(arp.sender_mac.clone());
-                ip_mac_packets.entry(arp.sender_ip.clone()).or_default().push(pkt.index);
-            }
+            ip_mac_map.entry(arp.sender_ip.clone()).or_default().insert(arp.sender_mac.clone());
+            ip_mac_packets.entry(arp.sender_ip.clone()).or_default().push(pkt.index);
         }
     }
 
@@ -231,7 +226,7 @@ fn detect_arp_spoofing(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
         if macs.len() > 1 {
             let packet_indices = ip_mac_packets.get(ip).cloned().unwrap_or_default();
             let first_seen = packet_indices.iter()
-                .filter_map(|&i| packets.get(i).map(|p| p.timestamp))
+                .filter_map(|&i| view.packets.get(i).map(|p| p.timestamp))
                 .fold(f64::INFINITY, f64::min);
 
             findings.push(ThreatFinding {
@@ -254,41 +249,34 @@ fn detect_arp_spoofing(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
     findings
 }
 
-fn detect_beaconing(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
-    // Look for regular outbound connection intervals to a single external IP
-    let mut conn_times: HashMap<(String, String), Vec<f64>> = HashMap::new();
-    let mut conn_packets: HashMap<(String, String), Vec<usize>> = HashMap::new();
+fn detect_beaconing(view: &IndexedView, thresholds: &crate::config::AlertThresholds) -> Vec<ThreatFinding> {
+    let mut conn_times: HashMap<(IpAddr, IpAddr), Vec<f64>> = HashMap::new();
+    let mut conn_packets: HashMap<(IpAddr, IpAddr), Vec<usize>> = HashMap::new();
 
-    for pkt in packets {
-        if pkt.protocol != "TCP" { continue; }
-        if let Some(layers) = &pkt.layers.transport {
-            if let Some(flags) = &layers.flags {
-                if flags.contains("SYN") && !flags.contains("ACK") {
-                    if let (Some(src), Some(dst)) = (&pkt.src_ip, &pkt.dst_ip) {
-                        if !is_private_ip(dst) {
-                            let key = (src.clone(), dst.clone());
-                            conn_times.entry(key.clone()).or_default().push(pkt.timestamp);
-                            conn_packets.entry(key).or_default().push(pkt.index);
-                        }
-                    }
-                }
+    for &i in &view.tcp_syn {
+        let pkt = &view.packets[i];
+        if let (Some(src), Some(dst)) = (pkt.src_ip, pkt.dst_ip) {
+            if !is_private_addr(&dst) {
+                let key = (src, dst);
+                conn_times.entry(key).or_default().push(pkt.timestamp);
+                conn_packets.entry(key).or_default().push(pkt.index);
             }
         }
     }
 
     let mut findings = Vec::new();
     for ((src, dst), mut times) in conn_times {
-        if times.len() < 5 { continue; }
-        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        if times.len() < thresholds.beaconing_min_connections { continue; }
+        times.sort_by(|a, b| a.total_cmp(b));
 
         let intervals: Vec<f64> = times.windows(2).map(|w| w[1] - w[0]).collect();
         let mean = intervals.iter().sum::<f64>() / intervals.len() as f64;
         let variance = intervals.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / intervals.len() as f64;
         let cv = if mean > 0.0 { variance.sqrt() / mean } else { f64::INFINITY };
 
-        // Low coefficient of variation suggests beaconing (< 0.2 is very regular)
-        if cv < 0.2 && mean > 1.0 && mean < 3600.0 {
-            let packet_indices = conn_packets.get(&(src.clone(), dst.clone())).cloned().unwrap_or_default();
+        // Low coefficient of variation suggests beaconing
+        if cv < thresholds.beaconing_max_cv && mean > 1.0 && mean < 3600.0 {
+            let packet_indices = conn_packets.get(&(src, dst)).cloned().unwrap_or_default();
             let first_seen = times[0];
             findings.push(ThreatFinding {
                 severity: "High".to_string(),
@@ -308,17 +296,17 @@ fn detect_beaconing(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
     findings
 }
 
-fn detect_traffic_spikes(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
-    if packets.is_empty() { return Vec::new(); }
+fn detect_traffic_spikes(view: &IndexedView, thresholds: &crate::config::AlertThresholds) -> Vec<ThreatFinding> {
+    if view.packets.is_empty() { return Vec::new(); }
 
-    let mut bytes_per_ip: HashMap<String, usize> = HashMap::new();
-    let mut packets_per_ip: HashMap<String, Vec<usize>> = HashMap::new();
-    let total_bytes: usize = packets.iter().map(|p| p.length).sum();
+    let mut bytes_per_ip: HashMap<IpAddr, usize> = HashMap::new();
+    let mut packets_per_ip: HashMap<IpAddr, Vec<usize>> = HashMap::new();
+    let total_bytes: usize = view.packets.iter().map(|p| p.length).sum();
 
-    for pkt in packets {
-        if let Some(src) = &pkt.src_ip {
-            *bytes_per_ip.entry(src.clone()).or_insert(0) += pkt.length;
-            packets_per_ip.entry(src.clone()).or_default().push(pkt.index);
+    for pkt in view.packets {
+        if let Some(src) = pkt.src_ip {
+            *bytes_per_ip.entry(src).or_insert(0) += pkt.length;
+            packets_per_ip.entry(src).or_default().push(pkt.index);
         }
     }
 
@@ -329,10 +317,10 @@ fn detect_traffic_spikes(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
     let mut findings = Vec::new();
     for (ip, bytes) in &bytes_per_ip {
         let pct = *bytes as f64 / total_bytes as f64;
-        if pct > 0.5 && bytes_per_ip.len() > 2 {
+        if pct > thresholds.traffic_spike_percentage && bytes_per_ip.len() > 2 {
             let packet_indices = packets_per_ip.get(ip).cloned().unwrap_or_default();
             let first_seen = packet_indices.iter()
-                .filter_map(|&i| packets.get(i).map(|p| p.timestamp))
+                .filter_map(|&i| view.packets.get(i).map(|p| p.timestamp))
                 .fold(f64::INFINITY, f64::min);
 
             findings.push(ThreatFinding {
@@ -353,90 +341,60 @@ fn detect_traffic_spikes(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
     findings
 }
 
-fn detect_cleartext_credentials(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
+fn detect_cleartext_credentials(view: &IndexedView) -> Vec<ThreatFinding> {
     let mut findings = Vec::new();
 
-    for pkt in packets {
-        if let Some(app) = &pkt.layers.application {
-            if app.protocol == "HTTP" {
-                let data = &app.data;
-                // Check for HTTP Basic Auth header
-                if let Some(headers) = data.get("headers") {
-                    if let Some(auth) = headers.get("Authorization") {
-                        let auth_str = auth.as_str().unwrap_or("");
-                        if auth_str.starts_with("Basic ") {
-                            findings.push(ThreatFinding {
-                                severity: "High".to_string(),
-                                category: "Credential Exposure".to_string(),
-                                title: format!(
-                                    "HTTP Basic Auth Credentials in Cleartext (Packet #{})",
-                                    pkt.index
-                                ),
-                                description: format!(
-                                    "Packet #{} contains an HTTP Basic Authorization header transmitting \
-                                    credentials in plaintext (base64-encoded). Anyone capturing this \
-                                    traffic can decode and replay these credentials.",
-                                    pkt.index
-                                ),
-                                first_seen: pkt.timestamp,
-                                packet_indices: vec![pkt.index],
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        // FTP credential check
-        if pkt.protocol == "TCP" {
-            if let (Some(sp), Some(dp)) = (pkt.src_port, pkt.dst_port) {
-                if sp == 21 || dp == 21 {
-                    findings.push(ThreatFinding {
-                        severity: "High".to_string(),
-                        category: "Credential Exposure".to_string(),
-                        title: "FTP Session Detected (Cleartext Protocol)".to_string(),
-                        description: "FTP traffic was observed, which transmits credentials and data \
-                            in plaintext. Any FTP username and password exchanged in this capture \
-                            can be read directly from the packet stream."
-                            .to_string(),
-                        first_seen: pkt.timestamp,
-                        packet_indices: vec![pkt.index],
-                    });
-                    break; // one finding is enough
-                }
-            }
+    // HTTP Basic Auth — iterate the HTTP bucket only.
+    for &i in &view.http {
+        let pkt = &view.packets[i];
+        let Some(app) = &pkt.layers.application else { continue };
+        let Some(headers) = app.data.get("headers") else { continue };
+        let Some(auth) = headers.get("Authorization") else { continue };
+        if auth.as_str().unwrap_or("").starts_with("Basic ") {
+            findings.push(ThreatFinding {
+                severity: "High".to_string(),
+                category: "Credential Exposure".to_string(),
+                title: format!("HTTP Basic Auth Credentials in Cleartext (Packet #{})", pkt.index),
+                description: format!(
+                    "Packet #{} contains an HTTP Basic Authorization header transmitting \
+                    credentials in plaintext (base64-encoded). Anyone capturing this \
+                    traffic can decode and replay these credentials.",
+                    pkt.index
+                ),
+                first_seen: pkt.timestamp,
+                packet_indices: vec![pkt.index],
+            });
         }
     }
 
-    // Deduplicate
+    // FTP cleartext check — first matching TCP packet.
+    if let Some(pkt) = view.tcp.iter().map(|&i| &view.packets[i])
+        .find(|p| matches!(p.src_port, Some(21)) || matches!(p.dst_port, Some(21)))
+    {
+        findings.push(ThreatFinding {
+            severity: "High".to_string(),
+            category: "Credential Exposure".to_string(),
+            title: "FTP Session Detected (Cleartext Protocol)".to_string(),
+            description: "FTP traffic was observed, which transmits credentials and data \
+                in plaintext. Any FTP username and password exchanged in this capture \
+                can be read directly from the packet stream."
+                .to_string(),
+            first_seen: pkt.timestamp,
+            packet_indices: vec![pkt.index],
+        });
+    }
+
     findings.dedup_by(|a, b| a.title == b.title);
     findings
 }
 
-fn is_private_ip(ip: &str) -> bool {
-    if ip.starts_with("10.") || ip.starts_with("192.168.") || ip == "127.0.0.1" {
-        return true;
-    }
-    if let Some(rest) = ip.strip_prefix("172.") {
-        if let Some(second) = rest.split('.').next() {
-            if let Ok(n) = second.parse::<u8>() {
-                if (16..=31).contains(&n) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
+fn detect_icmp_ping_activity(view: &IndexedView) -> Vec<ThreatFinding> {
+    let mut pairs: HashMap<(IpAddr, IpAddr), Vec<usize>> = HashMap::new();
 
-fn detect_icmp_ping_activity(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
-    let mut pairs: HashMap<(String, String), Vec<usize>> = HashMap::new();
-
-    for pkt in packets {
-        if pkt.protocol == "ICMP" && pkt.info.contains("Echo Request") {
-            if let (Some(src), Some(dst)) = (&pkt.src_ip, &pkt.dst_ip) {
-                pairs.entry((src.clone(), dst.clone())).or_default().push(pkt.index);
-            }
+    for &i in &view.icmp_echo_req {
+        let pkt = &view.packets[i];
+        if let (Some(src), Some(dst)) = (pkt.src_ip, pkt.dst_ip) {
+            pairs.entry((src, dst)).or_default().push(pkt.index);
         }
     }
 
@@ -444,12 +402,12 @@ fn detect_icmp_ping_activity(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
         return Vec::new();
     }
 
-    let unique_sources: std::collections::HashSet<&str> = pairs.keys().map(|(s, _)| s.as_str()).collect();
-    let unique_targets: std::collections::HashSet<&str> = pairs.keys().map(|(_, d)| d.as_str()).collect();
+    let unique_sources: std::collections::HashSet<IpAddr> = pairs.keys().map(|(s, _)| *s).collect();
+    let unique_targets: std::collections::HashSet<IpAddr> = pairs.keys().map(|(_, d)| *d).collect();
     let total_requests: usize = pairs.values().map(|v| v.len()).sum();
     let packet_indices: Vec<usize> = pairs.values().flatten().copied().take(50).collect();
     let first_seen = packet_indices.iter()
-        .filter_map(|&i| packets.get(i).map(|p| p.timestamp))
+        .filter_map(|&i| view.packets.get(i).map(|p| p.timestamp))
         .fold(f64::INFINITY, f64::min);
 
     vec![ThreatFinding {
@@ -466,22 +424,21 @@ fn detect_icmp_ping_activity(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
     }]
 }
 
-fn detect_icmp_flood(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
-    let mut src_counts: HashMap<String, Vec<usize>> = HashMap::new();
+fn detect_icmp_flood(view: &IndexedView, thresholds: &crate::config::AlertThresholds) -> Vec<ThreatFinding> {
+    let mut src_counts: HashMap<IpAddr, Vec<usize>> = HashMap::new();
 
-    for pkt in packets {
-        if pkt.protocol == "ICMP" && pkt.info.contains("Echo Request") {
-            if let Some(src) = &pkt.src_ip {
-                src_counts.entry(src.clone()).or_default().push(pkt.index);
-            }
+    for &i in &view.icmp_echo_req {
+        let pkt = &view.packets[i];
+        if let Some(src) = pkt.src_ip {
+            src_counts.entry(src).or_default().push(pkt.index);
         }
     }
 
     let mut findings = Vec::new();
     for (src, indices) in &src_counts {
-        if indices.len() > 50 {
+        if indices.len() > thresholds.icmp_flood_minimum {
             let first_seen = indices.iter()
-                .filter_map(|&i| packets.get(i).map(|p| p.timestamp))
+                .filter_map(|&i| view.packets.get(i).map(|p| p.timestamp))
                 .fold(f64::INFINITY, f64::min);
 
             findings.push(ThreatFinding {
@@ -489,10 +446,10 @@ fn detect_icmp_flood(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
                 category: "DoS".to_string(),
                 title: format!("ICMP Flood from {}", src),
                 description: format!(
-                    "{} sent {} ICMP echo requests, which exceeds the flood threshold of 50. \
+                    "{} sent {} ICMP echo requests, which exceeds the flood threshold of {}. \
                     This volume of ping traffic may indicate a denial-of-service attack or aggressive \
                     network scanning.",
-                    src, indices.len()
+                    src, indices.len(), thresholds.icmp_flood_minimum
                 ),
                 first_seen,
                 packet_indices: indices.iter().copied().take(50).collect(),
@@ -502,10 +459,10 @@ fn detect_icmp_flood(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
     findings
 }
 
-fn detect_large_icmp(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
-    let large: Vec<usize> = packets.iter()
-        .filter(|p| p.protocol == "ICMP" && p.length > 1024)
-        .map(|p| p.index)
+fn detect_large_icmp(view: &IndexedView) -> Vec<ThreatFinding> {
+    let large: Vec<usize> = view.icmp.iter()
+        .copied()
+        .filter(|&i| view.packets[i].length > 1024)
         .collect();
 
     if large.is_empty() {
@@ -513,7 +470,7 @@ fn detect_large_icmp(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
     }
 
     let first_seen = large.iter()
-        .filter_map(|&i| packets.get(i).map(|p| p.timestamp))
+        .filter_map(|&i| view.packets.get(i).map(|p| p.timestamp))
         .fold(f64::INFINITY, f64::min);
 
     vec![ThreatFinding {
@@ -530,22 +487,21 @@ fn detect_large_icmp(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
     }]
 }
 
-fn detect_udp_flood(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
-    let mut src_counts: HashMap<String, Vec<usize>> = HashMap::new();
+fn detect_udp_flood(view: &IndexedView, thresholds: &crate::config::AlertThresholds) -> Vec<ThreatFinding> {
+    let mut src_counts: HashMap<IpAddr, Vec<usize>> = HashMap::new();
 
-    for pkt in packets {
-        if pkt.protocol == "UDP" {
-            if let Some(src) = &pkt.src_ip {
-                src_counts.entry(src.clone()).or_default().push(pkt.index);
-            }
+    for &i in &view.udp {
+        let pkt = &view.packets[i];
+        if let Some(src) = pkt.src_ip {
+            src_counts.entry(src).or_default().push(pkt.index);
         }
     }
 
     let mut findings = Vec::new();
     for (src, indices) in &src_counts {
-        if indices.len() > 500 {
+        if indices.len() > thresholds.udp_flood_minimum {
             let first_seen = indices.iter()
-                .filter_map(|&i| packets.get(i).map(|p| p.timestamp))
+                .filter_map(|&i| view.packets.get(i).map(|p| p.timestamp))
                 .fold(f64::INFINITY, f64::min);
 
             findings.push(ThreatFinding {
@@ -553,10 +509,10 @@ fn detect_udp_flood(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
                 category: "DoS".to_string(),
                 title: format!("UDP Flood from {}", src),
                 description: format!(
-                    "{} sent {} UDP packets, exceeding the flood threshold of 500. \
+                    "{} sent {} UDP packets, exceeding the flood threshold of {}. \
                     High-rate UDP traffic from a single source is a common indicator of \
                     a UDP-based denial-of-service attack.",
-                    src, indices.len()
+                    src, indices.len(), thresholds.udp_flood_minimum
                 ),
                 first_seen,
                 packet_indices: indices.iter().copied().take(50).collect(),
@@ -566,7 +522,7 @@ fn detect_udp_flood(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
     findings
 }
 
-fn detect_suspicious_ports(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
+fn detect_suspicious_ports(view: &IndexedView) -> Vec<ThreatFinding> {
     let suspicious: &[(u16, &str, &str, &str)] = &[
         (4444,  "Critical", "Malware",           "Metasploit default handler"),
         (31337, "Critical", "Malware",            "Back Orifice / elite hacking"),
@@ -576,19 +532,27 @@ fn detect_suspicious_ports(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
         (1337,  "High",     "Malware",            "Common backdoor port"),
     ];
 
+    // Single pass: bucket all matching packets by port.
+    let suspicious_set: std::collections::HashSet<u16> =
+        suspicious.iter().map(|(p, _, _, _)| *p).collect();
+    let mut matched_by_port: HashMap<u16, Vec<usize>> = HashMap::new();
+    for pkt in view.packets {
+        for port in [pkt.dst_port, pkt.src_port].into_iter().flatten() {
+            if suspicious_set.contains(&port) {
+                matched_by_port.entry(port).or_default().push(pkt.index);
+                break;
+            }
+        }
+    }
+
     let mut findings = Vec::new();
     for &(port, severity, category, label) in suspicious {
-        let matched: Vec<usize> = packets.iter()
-            .filter(|p| p.dst_port == Some(port) || p.src_port == Some(port))
-            .map(|p| p.index)
-            .collect();
-
-        if matched.is_empty() {
-            continue;
-        }
-
+        let matched = match matched_by_port.remove(&port) {
+            Some(m) if !m.is_empty() => m,
+            _ => continue,
+        };
         let first_seen = matched.iter()
-            .filter_map(|&i| packets.get(i).map(|p| p.timestamp))
+            .filter_map(|&i| view.packets.get(i).map(|p| p.timestamp))
             .fold(f64::INFINITY, f64::min);
 
         findings.push(ThreatFinding {
@@ -608,8 +572,8 @@ fn detect_suspicious_ports(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
     findings
 }
 
-fn detect_telnet(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
-    let matched: Vec<usize> = packets.iter()
+fn detect_telnet(view: &IndexedView) -> Vec<ThreatFinding> {
+    let matched: Vec<usize> = view.packets.iter()
         .filter(|p| p.dst_port == Some(23) || p.src_port == Some(23))
         .map(|p| p.index)
         .collect();
@@ -619,7 +583,7 @@ fn detect_telnet(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
     }
 
     let first_seen = matched.iter()
-        .filter_map(|&i| packets.get(i).map(|p| p.timestamp))
+        .filter_map(|&i| view.packets.get(i).map(|p| p.timestamp))
         .fold(f64::INFINITY, f64::min);
 
     vec![ThreatFinding {
@@ -637,36 +601,31 @@ fn detect_telnet(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
     }]
 }
 
-fn detect_syn_flood(packets: &[PacketMeta]) -> Vec<ThreatFinding> {
-    let mut syn_counts: HashMap<String, Vec<usize>> = HashMap::new();
-    let mut synack_received: HashMap<String, usize> = HashMap::new();
+fn detect_syn_flood(view: &IndexedView, thresholds: &crate::config::AlertThresholds) -> Vec<ThreatFinding> {
+    let mut syn_counts: HashMap<IpAddr, Vec<usize>> = HashMap::new();
+    let mut synack_received: HashMap<IpAddr, usize> = HashMap::new();
 
-    for pkt in packets {
-        if pkt.protocol != "TCP" { continue; }
-        if let Some(layers) = &pkt.layers.transport {
-            if let Some(flags) = &layers.flags {
-                if flags.contains("SYN") && !flags.contains("ACK") {
-                    if let Some(src) = &pkt.src_ip {
-                        syn_counts.entry(src.clone()).or_default().push(pkt.index);
-                    }
-                }
-                if flags.contains("SYN") && flags.contains("ACK") {
-                    if let Some(dst) = &pkt.dst_ip {
-                        *synack_received.entry(dst.clone()).or_insert(0) += 1;
-                    }
-                }
-            }
+    for &i in &view.tcp_syn {
+        let pkt = &view.packets[i];
+        if let Some(src) = pkt.src_ip {
+            syn_counts.entry(src).or_default().push(pkt.index);
+        }
+    }
+    for &i in &view.tcp_synack {
+        let pkt = &view.packets[i];
+        if let Some(dst) = pkt.dst_ip {
+            *synack_received.entry(dst).or_insert(0) += 1;
         }
     }
 
     let mut findings = Vec::new();
     for (src, indices) in &syn_counts {
-        if indices.len() <= 200 { continue; }
+        if indices.len() <= thresholds.syn_flood_minimum { continue; }
         let responses = synack_received.get(src).copied().unwrap_or(0);
         // Flood if SYNs >> SYN-ACKs (handshakes rarely completed)
         if responses < indices.len() / 10 {
             let first_seen = indices.iter()
-                .filter_map(|&i| packets.get(i).map(|p| p.timestamp))
+                .filter_map(|&i| view.packets.get(i).map(|p| p.timestamp))
                 .fold(f64::INFINITY, f64::min);
 
             findings.push(ThreatFinding {

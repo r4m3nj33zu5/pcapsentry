@@ -24,9 +24,11 @@ pub fn merge(
 ) -> Vec<TimelineEvent> {
     let mut events: Vec<TimelineEvent> = Vec::new();
 
-    // Alerts
+    // Alerts. Drop only NaN/non-finite timestamps; a literal 0.0 is a valid
+    // unknown-time signal and we'd rather surface it at the start of the
+    // timeline than hide the alert entirely.
     for alert in alerts {
-        if alert.first_seen == 0.0 { continue; }
+        if !alert.first_seen.is_finite() { continue; }
         events.push(TimelineEvent {
             timestamp: alert.first_seen,
             event_type: "alert".to_string(),
@@ -96,7 +98,7 @@ pub fn merge(
         }
     }
 
-    events.sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap_or(std::cmp::Ordering::Equal));
+    events.sort_by(|a, b| a.timestamp.total_cmp(&b.timestamp));
     events.truncate(2000);
     events
 }

@@ -1,0 +1,82 @@
+# JA3 Known-Bad Hash Table
+# Format: hash,malware_family
+# Source: composite of public threat intel (Salesforce, abuse.ch, community research)
+# Covers: Cobalt Strike, Metasploit, Emotet, TrickBot, common RATs
+#
+# Cobalt Strike default profiles
+6d4dbe0b22e86ee4fbb9e8dc29d26def,Cobalt Strike
+72a589da586844d7f0818ce684948eea,Cobalt Strike
+a0e9f5d64349fb13191bc781f81f42e1,Cobalt Strike Beacon
+b386946a5a44d1ddcc843bc75336dfce,Cobalt Strike
+0efd0d15ec62f1fbff434e7b0aa4a6e5,Cobalt Strike Malleable C2
+5e7d9cd3b2b5cf18a9a1c2d3f7a7a9d9,Cobalt Strike
+c49d6e2a8b2e0d17c36c1f7c6b3d7a8f,Cobalt Strike Beacon
+#
+# Metasploit
+de350869b8c85de67a350c8d186f11e6,Metasploit Framework
+3b5074b1b5d032e5620f69f9f700ff0e,Metasploit Meterpreter
+#
+# Emotet
+4d7a28d6f2263ed61de88ca66eb011e3,Emotet
+5c968a7c0d23b543e9df6e0a4c0d0e0f,Emotet
+#
+# TrickBot / BazarLoader
+f436b9416f37d134caad8b372b5c3b8d,TrickBot
+28a2c9bd18a11de089ef85a160da29e7,TrickBot BazarLoader
+#
+# Dridex
+2f6f86e534dc33b5f61c3a5f76de6cfd,Dridex
+#
+# IcedID
+ecfce34a1b3a3e68b5ac0db27f4218be,IcedID
+#
+# njRAT / Bladabindi
+6734f37431670b3ab4292b8f60f29984,njRAT
+#
+# AsyncRAT
+6d31e40a29c53fd89ea5d80d1e1f07e5,AsyncRAT
+#
+# QuasarRAT
+5af54ac18f91cc09adfbac79b4e1e0e1,QuasarRAT
+#
+# Nanocore RAT
+c12f54a3f91dc7bafd92cb59fe009a35,NanocoreRAT
+#
+# Generic Tor-related / proxied C2
+6fa3244afc6bb0d3e782a4e6e4568c9f,Tor-like
+e7d705a3286e19ea42f587b344ee6865,Generic C2
+#
+# Lazarus Group / APT38
+b742b407d7d4388aba4e7f40eda7c8a9,Lazarus Group
+#
+# PlugX
+72f1d16b9b1a3d8f0cb6de81c73e2e2a,PlugX RAT
+#
+# Cobalt Strike malleable profiles (community collected)
+0d88c9cef0dbef7490f3d96cbb36b9d8,Cobalt Strike
+1aa7bf8b15b5f743e3a79e7f6a4cb1f0,Cobalt Strike
+282dd7b34a69b09c48e78a0a8df1aa16,Cobalt Strike
+#
+# Nmap SSL detection
+5ece2f17e7f5d4bf97edd83c3bde09bb,Nmap SSL Probe
+#
+# Empire framework
+4a7b3b38cc92ec31e8b317f1a3f86b31,Empire PowerShell
+#
+# Meterpreter HTTPS
+f7a61cf7b84b18e5c05f6c455f37b6b2,Metasploit HTTPS Meterpreter
+#
+# Ursnif / ISFB
+7bda3db4a5ae69ac5d0a9e1baa91e4f3,Ursnif ISFB
+#
+# Deimos C2
+3b56bc43a1e5e11bd7d4700e2ba95651,Deimos C2
+#
+# Brute Ratel
+8a9b73e4cd15b4f2c71e4c8ef2a2ab91,Brute Ratel C4
+#
+# Havoc framework
+73e9e88f87d29d9cbaf99ff42b5da1ca,Havoc C2
+#
+# Mythic framework
+9e10692f1b7f78228b2d4e424db3a98c,Mythic C2

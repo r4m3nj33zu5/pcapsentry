@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 use crate::parser::PacketMeta;
 use crate::analysis::dns_http::{DnsEntry, HttpEntry};
 use crate::analysis::geo::GeoPoint;
-use crate::analysis::utils::is_private_ip;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct IocIp {
@@ -59,11 +58,12 @@ pub fn build_bundle(
     http_log: &[HttpEntry],
     geo_points: &[GeoPoint],
 ) -> IocBundle {
-    // Build IP stats from packets
-    let mut ip_stats: HashMap<String, (usize, usize)> = HashMap::new(); // ip -> (packets, bytes)
+    // Build IP stats from packets. Keyed by IpAddr (16-byte Copy) rather
+    // than per-packet String alloc for the HashMap key.
+    let mut ip_stats: HashMap<std::net::IpAddr, (usize, usize)> = HashMap::new();
     for pkt in packets {
-        for ip in [&pkt.src_ip, &pkt.dst_ip].into_iter().flatten() {
-            let e = ip_stats.entry(ip.clone()).or_insert((0, 0));
+        for ip in [pkt.src_ip, pkt.dst_ip].into_iter().flatten() {
+            let e = ip_stats.entry(ip).or_insert((0, 0));
             e.0 += 1;
             e.1 += pkt.length;
         }
@@ -76,8 +76,9 @@ pub fn build_bundle(
 
     let ips: Vec<IocIp> = ip_stats
         .into_iter()
-        .filter(|(ip, _)| !is_private_ip(ip))
-        .map(|(ip, (packet_count, bytes))| {
+        .filter(|(ip, _)| !crate::analysis::utils::is_private_addr(ip))
+        .map(|(ip_addr, (packet_count, bytes))| {
+            let ip = ip_addr.to_string();
             let (country, asn_org) = geo_map.get(ip.as_str())
                 .map(|(c, a)| (Some(c.to_string()), a.map(|s| s.to_string())))
                 .unwrap_or((None, None));

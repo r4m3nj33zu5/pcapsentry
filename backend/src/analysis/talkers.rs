@@ -53,26 +53,26 @@ impl IpStats {
 }
 
 pub fn compute(packets: &[PacketMeta]) -> (Vec<TalkerStats>, Vec<TalkerStats>) {
-    let mut stats: HashMap<String, IpStats> = HashMap::new();
-    let mut ip_mac: HashMap<String, String> = HashMap::new();
+    let mut stats: HashMap<std::net::IpAddr, IpStats> = HashMap::new();
+    let mut ip_mac: HashMap<std::net::IpAddr, String> = HashMap::new();
 
     for pkt in packets {
         let ts = pkt.timestamp;
 
-        if let Some(src) = &pkt.src_ip {
-            let entry = stats.entry(src.clone()).or_insert_with(|| IpStats::new(ts));
+        if let Some(src) = pkt.src_ip {
+            let entry = stats.entry(src).or_insert_with(|| IpStats::new(ts));
             entry.update_ts(ts);
             entry.packets_sent += 1;
             entry.bytes_sent += pkt.length;
             *entry.protocols.entry(pkt.protocol.clone()).or_insert(0) += 1;
 
             if let Some(mac) = &pkt.src_mac {
-                ip_mac.entry(src.clone()).or_insert_with(|| mac.clone());
+                ip_mac.entry(src).or_insert_with(|| mac.clone());
             }
         }
 
-        if let Some(dst) = &pkt.dst_ip {
-            let entry = stats.entry(dst.clone()).or_insert_with(|| IpStats::new(ts));
+        if let Some(dst) = pkt.dst_ip {
+            let entry = stats.entry(dst).or_insert_with(|| IpStats::new(ts));
             entry.update_ts(ts);
             entry.packets_received += 1;
             entry.bytes_received += pkt.length;
@@ -81,19 +81,19 @@ pub fn compute(packets: &[PacketMeta]) -> (Vec<TalkerStats>, Vec<TalkerStats>) {
 
     let all: Vec<TalkerStats> = stats
         .into_iter()
-        .map(|(ip, s)| {
+        .map(|(ip_addr, s)| {
             let mut protocols: Vec<ProtocolCount> = s.protocols
                 .into_iter()
                 .map(|(protocol, count)| ProtocolCount { protocol, count })
                 .collect();
             protocols.sort_by(|a, b| b.count.cmp(&a.count));
 
-            let mac = ip_mac.get(&ip).cloned();
+            let mac = ip_mac.get(&ip_addr).cloned();
             let vendor = mac.as_deref().and_then(oui_vendor).map(|v| v.to_string());
 
             TalkerStats {
                 total_bytes: s.bytes_sent + s.bytes_received,
-                ip,
+                ip: ip_addr.to_string(),
                 mac,
                 vendor,
                 packets_sent: s.packets_sent,

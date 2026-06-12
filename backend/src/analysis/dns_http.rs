@@ -50,6 +50,8 @@ pub struct HttpEntry {
     pub ua_category: Option<String>,
     #[serde(default)]
     pub is_ua_suspicious: bool,
+    #[serde(default)]
+    pub reassembled: bool,
 }
 
 const SUSPICIOUS_TLDS: &[&str] = &[".tk", ".xyz", ".ml", ".ga", ".cf", ".pw", ".top", ".click", ".ru"];
@@ -124,8 +126,8 @@ fn parse_dns_entry(pkt: &PacketMeta, data: &serde_json::Value) -> Option<DnsEntr
     Some(DnsEntry {
         timestamp: pkt.timestamp,
         timestamp_str: pkt.timestamp_str.clone(),
-        src_ip: pkt.src_ip.clone().unwrap_or_default(),
-        dst_ip: pkt.dst_ip.clone().unwrap_or_default(),
+        src_ip: pkt.src_ip.map(|ip| ip.to_string()).unwrap_or_default(),
+        dst_ip: pkt.dst_ip.map(|ip| ip.to_string()).unwrap_or_default(),
         is_response,
         query_type,
         name,
@@ -212,8 +214,8 @@ fn parse_http_entry(pkt: &PacketMeta, data: &serde_json::Value) -> Option<HttpEn
     Some(HttpEntry {
         timestamp: pkt.timestamp,
         timestamp_str: pkt.timestamp_str.clone(),
-        src_ip: pkt.src_ip.clone().unwrap_or_default(),
-        dst_ip: pkt.dst_ip.clone().unwrap_or_default(),
+        src_ip: pkt.src_ip.map(|ip| ip.to_string()).unwrap_or_default(),
+        dst_ip: pkt.dst_ip.map(|ip| ip.to_string()).unwrap_or_default(),
         entry_type,
         method,
         host,
@@ -227,6 +229,7 @@ fn parse_http_entry(pkt: &PacketMeta, data: &serde_json::Value) -> Option<HttpEn
         body_preview: None,
         ua_category,
         is_ua_suspicious,
+        reassembled: false,
     })
 }
 
@@ -264,4 +267,114 @@ fn check_http_suspicious(_data: &serde_json::Value, headers: Option<&serde_json:
         return (true, Some("Suspicious User-Agent (tool/scanner)".to_string()));
     }
     (false, None)
+}
+
+pub fn extract_from_streams(streams: &[crate::reassembly::ReassembledStream], http_log: &mut Vec<HttpEntry>) {
+    const HTTP_PORTS: &[u16] = &[80, 8080, 8000, 8888, 3000, 3128];
+    for stream in streams {
+        if !HTTP_PORTS.contains(&stream.dst_port) && !HTTP_PORTS.contains(&stream.src_port) {
+            continue;
+        }
+        // Parse forward (request) payload
+        if !stream.forward_payload.is_empty() {
+            if let Some(entry) = parse_stream_http(&stream.forward_payload, stream, "request") {
+                http_log.push(entry);
+            }
+        }
+        // Parse backward (response) payload
+        if !stream.backward_payload.is_empty() {
+            if let Some(entry) = parse_stream_http(&stream.backward_payload, stream, "response") {
+                http_log.push(entry);
+            }
+        }
+    }
+}
+
+fn parse_stream_http(payload: &[u8], stream: &crate::reassembly::ReassembledStream, expected_type: &str) -> Option<HttpEntry> {
+    let text = std::str::from_utf8(payload).ok()?;
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() { return None; }
+    let first = lines[0];
+    let parts: Vec<&str> = first.splitn(3, ' ').collect();
+    if parts.len() != 3 { return None; }
+
+    let mut headers_map = serde_json::Map::new();
+    for line in &lines[1..] {
+        if line.is_empty() { break; }
+        if let Some((k, v)) = line.split_once(": ") {
+            headers_map.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+        }
+    }
+
+    // Find body (after blank line)
+    let body_start = text.find("\r\n\r\n").map(|i| i + 4)
+        .or_else(|| text.find("\n\n").map(|i| i + 2));
+    let body_preview = body_start.map(|i| {
+        let body = &text[i..];
+        let preview_len = body.len().min(200);
+        body[..preview_len].to_string()
+    });
+
+    if expected_type == "request" {
+        let method = parts[0];
+        if !matches!(method, "GET"|"POST"|"PUT"|"DELETE"|"HEAD"|"OPTIONS"|"PATCH"|"CONNECT"|"TRACE") {
+            return None;
+        }
+        let host = headers_map.get("Host").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let ua = headers_map.get("User-Agent").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let (ua_category, is_ua_suspicious) = categorize_ua(ua.as_deref());
+        let auth = headers_map.get("Authorization").and_then(|v| v.as_str()).unwrap_or("");
+        let (suspicious, suspicious_reason) = if auth.starts_with("Basic ") {
+            (true, Some("HTTP Basic Auth credentials in cleartext (reassembled)".to_string()))
+        } else if is_ua_suspicious {
+            (true, Some("Suspicious User-Agent (tool/scanner)".to_string()))
+        } else {
+            (false, None)
+        };
+        Some(HttpEntry {
+            timestamp: stream.timestamp,
+            timestamp_str: format!("{:.3}", stream.timestamp),
+            src_ip: stream.src_ip.clone(),
+            dst_ip: stream.dst_ip.clone(),
+            entry_type: "request".to_string(),
+            method: Some(method.to_string()),
+            host,
+            path: Some(parts[1].to_string()),
+            status: None,
+            user_agent: ua,
+            suspicious,
+            suspicious_reason,
+            packet_index: stream.first_packet_idx,
+            content_type: None,
+            body_preview,
+            ua_category,
+            is_ua_suspicious,
+            reassembled: true,
+        })
+    } else {
+        // response
+        if !parts[0].starts_with("HTTP/") { return None; }
+        let status: u16 = parts[1].parse().ok()?;
+        let ct = headers_map.get("Content-Type").and_then(|v| v.as_str()).map(|s| s.to_string());
+        Some(HttpEntry {
+            timestamp: stream.timestamp,
+            timestamp_str: format!("{:.3}", stream.timestamp),
+            src_ip: stream.dst_ip.clone(),
+            dst_ip: stream.src_ip.clone(),
+            entry_type: "response".to_string(),
+            method: None,
+            host: None,
+            path: None,
+            status: Some(status),
+            user_agent: None,
+            suspicious: false,
+            suspicious_reason: None,
+            packet_index: stream.first_packet_idx,
+            content_type: ct,
+            body_preview,
+            ua_category: None,
+            is_ua_suspicious: false,
+            reassembled: true,
+        })
+    }
 }

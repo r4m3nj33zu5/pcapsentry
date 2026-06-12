@@ -11,9 +11,14 @@ pub mod tls;
 pub mod ioc;
 pub mod proto_hierarchy;
 pub mod timeline_events;
+pub mod beaconing;
+pub mod indexed;
+pub mod conversations;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::parser::PacketMeta;
 use self::threats::ThreatFinding;
@@ -27,6 +32,8 @@ use self::tls::TlsSession;
 use self::ioc::IocBundle;
 use self::proto_hierarchy::ProtoNode;
 use self::timeline_events::TimelineEvent;
+use self::beaconing::BeaconingCandidate;
+use self::conversations::SuspiciousConversation;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Overview {
@@ -114,6 +121,13 @@ pub struct AnalysisResult {
     pub proto_hierarchy: Vec<ProtoNode>,
     #[serde(default)]
     pub notes: String,
+    #[serde(default)]
+    pub beaconing: Vec<BeaconingCandidate>,
+    #[serde(default)]
+    pub suspicious_conversations: Vec<SuspiciousConversation>,
+    /// TCP streams stored in-memory only (not persisted/serialized).
+    #[serde(skip, default)]
+    pub streams: Vec<crate::reassembly::ReassembledStream>,
 }
 
 impl AnalysisResult {
@@ -145,30 +159,60 @@ impl AnalysisResult {
 pub fn analyze(
     overview: Overview,
     packets: Vec<PacketMeta>,
+    streams: Vec<crate::reassembly::ReassembledStream>,
     geo_enabled: bool,
+    config: &crate::config::AppConfig,
+    progress: &Arc<AtomicU8>,
 ) -> Result<AnalysisResult> {
+    // Build the shared index once: every detector that needs "all TCP SYNs"
+    // / "all ICMP echo requests" / "all ARP replies" now reads from the
+    // precomputed bucket instead of doing its own O(N) sweep.
+    progress.store(60, Ordering::Relaxed);
+    let view = indexed::IndexedView::build(&packets);
+    progress.store(62, Ordering::Relaxed);
     let timeline = build_timeline(&packets, &overview);
+    progress.store(63, Ordering::Relaxed);
     let protocol_stats = build_protocol_stats(&packets);
+    progress.store(64, Ordering::Relaxed);
     let (top_senders, top_receivers) = talkers::compute(&packets);
-    let threats = threats::detect(&packets);
+    progress.store(66, Ordering::Relaxed);
+    let threats = threats::detect(&view, &config.alert_thresholds, &config.whitelist);
+    progress.store(68, Ordering::Relaxed);
     let geo_points = if geo_enabled {
         geo::geolocate(&packets)
     } else {
         Vec::new()
     };
-    let (dns_log, http_log) = dns_http::extract(&packets);
-    let icmp_summary = icmp::summarize(&packets);
+    progress.store(70, Ordering::Relaxed);
+    let (dns_log, mut http_log) = dns_http::extract(&packets);
+    dns_http::extract_from_streams(&streams, &mut http_log);
+    progress.store(73, Ordering::Relaxed);
+    let icmp_summary = icmp::summarize(&view);
+    progress.store(75, Ordering::Relaxed);
     let top_ports = compute_top_ports(&packets);
     let packet_size_stats = compute_packet_size_stats(&packets);
+    progress.store(77, Ordering::Relaxed);
     let connection_flows = flows::compute(&packets);
 
     // New SOC analysis
-    let alert_findings = alerts::detect(&packets, &connection_flows, &dns_log);
+    progress.store(80, Ordering::Relaxed);
+    let alert_findings = alerts::detect(&view, &connection_flows, &dns_log, &config.alert_thresholds, &config.whitelist);
+    progress.store(84, Ordering::Relaxed);
     let tls_sessions = tls::extract(&packets);
+    progress.store(87, Ordering::Relaxed);
     let ioc = ioc::build_bundle(&packets, &dns_log, &http_log, &geo_points);
+    progress.store(89, Ordering::Relaxed);
     let proto_hier = proto_hierarchy::build(&packets);
+    progress.store(91, Ordering::Relaxed);
     let timeline_evts = timeline_events::merge(&alert_findings, &dns_log, &http_log, &tls_sessions);
+    progress.store(93, Ordering::Relaxed);
     let exec = executive::summarize(&alert_findings, &connection_flows, &geo_points, &overview, &tls_sessions);
+    progress.store(95, Ordering::Relaxed);
+    let beaconing_candidates = beaconing::detect(&view);
+    progress.store(96, Ordering::Relaxed);
+    let suspicious_conversations = conversations::compute(
+        &packets, &alert_findings, &beaconing_candidates, &tls_sessions, &streams);
+    progress.store(97, Ordering::Relaxed);
 
     Ok(AnalysisResult {
         overview,
@@ -192,6 +236,9 @@ pub fn analyze(
         timeline_events: timeline_evts,
         proto_hierarchy: proto_hier,
         notes: String::new(),
+        beaconing: beaconing_candidates,
+        suspicious_conversations,
+        streams,
     })
 }
 
@@ -201,8 +248,10 @@ fn build_timeline(packets: &[PacketMeta], overview: &Overview) -> Vec<TimelineBu
     }
 
     let duration = overview.capture_duration_secs;
-    let bucket_count = if duration < 10.0 { 20 } else if duration < 60.0 { 60 } else if duration < 3600.0 { 120 } else { 200 };
-    let bucket_size = if duration == 0.0 { 1.0 } else { duration / bucket_count as f64 };
+    let bucket_count: usize = if duration < 10.0 { 20 } else if duration < 60.0 { 60 } else if duration < 3600.0 { 120 } else { 200 };
+    // Guard against zero / negative / sub-nanosecond durations so we never
+    // hit a divide-by-zero or NaN bucket index.
+    let bucket_size = if duration > 1e-9 { duration / bucket_count as f64 } else { 1.0 };
     let start_ts = overview.first_packet.unwrap_or(0.0);
 
     let mut buckets: Vec<TimelineBucket> = (0..bucket_count)
@@ -213,13 +262,14 @@ fn build_timeline(packets: &[PacketMeta], overview: &Overview) -> Vec<TimelineBu
         })
         .collect();
 
+    let max_idx = bucket_count.saturating_sub(1);
     for pkt in packets {
-        let idx = if bucket_size > 0.0 {
-            ((pkt.timestamp - start_ts) / bucket_size) as usize
-        } else {
-            0
-        };
-        let idx = idx.min(bucket_count - 1);
+        // Clamp negative offsets (out-of-order packets, clock-skew, etc.) and
+        // non-finite values so the cast to usize never produces a bogus index.
+        let offset = (pkt.timestamp - start_ts).max(0.0);
+        let raw = offset / bucket_size;
+        let idx = if raw.is_finite() { raw.floor() as usize } else { 0 };
+        let idx = idx.min(max_idx);
         buckets[idx].packet_count += 1;
         buckets[idx].byte_count += pkt.length;
     }

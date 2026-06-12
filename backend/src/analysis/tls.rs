@@ -64,48 +64,93 @@ pub fn extract(packets: &[PacketMeta]) -> Vec<TlsSession> {
             _ => continue,
         };
 
-        let src_ip = pkt.src_ip.clone().unwrap_or_default();
-        let dst_ip = pkt.dst_ip.clone().unwrap_or_default();
+        let src_ip = pkt.src_ip.map(|ip| ip.to_string()).unwrap_or_default();
+        let dst_ip = pkt.dst_ip.map(|ip| ip.to_string()).unwrap_or_default();
         let src_port = pkt.src_port.unwrap_or(0);
         let dst_port = pkt.dst_port.unwrap_or(0);
         let fid = flow_id(&src_ip, &dst_ip, pkt.src_port, pkt.dst_port, "TLS");
 
-        let pkt_type = app["type"].as_str().unwrap_or("");
+        // A single packet may contain ClientHello, ServerHello, and
+        // Certificate fields merged together (one TCP segment can carry the
+        // full server flight). Check each field group independently rather
+        // than dispatching on a single "type" tag.
+        let has_client_hello = app.get("ja3_hash").is_some() || app.get("sni").is_some()
+            || app.get("cipher_suites").is_some();
+        let has_server_hello = app.get("negotiated_version_name").is_some()
+            || app.get("cipher_suite").is_some();
+        let has_certificate = app.get("cert_subject").is_some();
 
-        if pkt_type == "ClientHello" {
-            let ja3_hash = app["ja3_hash"].as_str().unwrap_or("").to_string();
-            let ja3_string = app["ja3_string"].as_str().unwrap_or("").to_string();
-            let legacy_version = app["legacy_version"].as_u64().unwrap_or(0) as u16;
-            let sni = app["sni"].as_str().map(|s| s.to_string());
-            let ciphers: Vec<u16> = app["cipher_suites"].as_array()
+        if !has_client_hello && !has_server_hello && !has_certificate { continue; }
+
+        let session = sessions_map.entry(fid.clone()).or_insert_with(|| TlsSession {
+            flow_id: fid.clone(),
+            src_ip: src_ip.clone(),
+            dst_ip: dst_ip.clone(),
+            src_port,
+            dst_port,
+            first_seen: pkt.timestamp,
+            ..TlsSession::default()
+        });
+
+        if has_client_hello {
+            let ja3_hash = app.get("ja3_hash").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let ja3_string = app.get("ja3_string").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let legacy_version = app.get("legacy_version").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+            let sni = app.get("sni").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let ciphers: Vec<u16> = app.get("cipher_suites").and_then(|v| v.as_array())
                 .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as u16)).collect())
                 .unwrap_or_default();
             let is_weak = ciphers.iter().any(|&cs| is_weak_cipher(cs));
             let known_bad_family = known_bad.get(&ja3_hash).cloned();
 
-            let session = sessions_map.entry(fid.clone()).or_insert_with(|| TlsSession {
-                flow_id: fid.clone(),
-                src_ip: src_ip.clone(),
-                dst_ip: dst_ip.clone(),
-                src_port,
-                dst_port,
-                sni: sni.clone(),
-                ja3_hash: ja3_hash.clone(),
-                ja3_string: ja3_string.clone(),
-                tls_version_offered: legacy_version,
-                known_bad_ja3: known_bad_family,
-                is_cipher_weak: is_weak,
-                first_seen: pkt.timestamp,
-                ..TlsSession::default()
-            });
-            session.packet_indices.push(pkt.index);
-            if pkt.timestamp < session.first_seen {
-                session.first_seen = pkt.timestamp;
+            if session.sni.is_none() { session.sni = sni; }
+            if session.ja3_hash.is_empty() { session.ja3_hash = ja3_hash; }
+            if session.ja3_string.is_empty() { session.ja3_string = ja3_string; }
+            if session.tls_version_offered == 0 { session.tls_version_offered = legacy_version; }
+            if known_bad_family.is_some() { session.known_bad_ja3 = known_bad_family; }
+            session.is_cipher_weak = session.is_cipher_weak || is_weak;
+        }
+
+        if has_server_hello {
+            let negotiated_version_name = app.get("negotiated_version_name")
+                .and_then(|v| v.as_str()).map(|s| s.to_string());
+            let cipher_suite = app.get("cipher_suite").and_then(|v| v.as_u64()).map(|n| n as u16);
+            if session.tls_version_negotiated.is_none() {
+                session.tls_version_negotiated = negotiated_version_name;
             }
+            if session.cipher_suite.is_none() {
+                session.cipher_suite = cipher_suite;
+                if let Some(cs) = cipher_suite {
+                    if is_weak_cipher(cs) { session.is_cipher_weak = true; }
+                }
+            }
+        }
+
+        if has_certificate {
+            if session.cert_subject.is_none() {
+                session.cert_subject = app.get("cert_subject").and_then(|v| v.as_str()).map(String::from);
+            }
+            if session.cert_issuer.is_none() {
+                session.cert_issuer = app.get("cert_issuer").and_then(|v| v.as_str()).map(String::from);
+            }
+            if session.cert_not_after.is_none() {
+                session.cert_not_after = app.get("cert_not_after").and_then(|v| v.as_str()).map(String::from);
+            }
+            if let Some(b) = app.get("is_self_signed").and_then(|v| v.as_bool()) {
+                session.is_self_signed = session.is_self_signed || b;
+            }
+            if let Some(b) = app.get("is_expired").and_then(|v| v.as_bool()) {
+                session.is_expired = session.is_expired || b;
+            }
+        }
+
+        session.packet_indices.push(pkt.index);
+        if pkt.timestamp < session.first_seen {
+            session.first_seen = pkt.timestamp;
         }
     }
 
     let mut result: Vec<TlsSession> = sessions_map.into_values().collect();
-    result.sort_by(|a, b| a.first_seen.partial_cmp(&b.first_seen).unwrap_or(std::cmp::Ordering::Equal));
+    result.sort_by(|a, b| a.first_seen.total_cmp(&b.first_seen));
     result
 }

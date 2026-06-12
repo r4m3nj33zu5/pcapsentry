@@ -1,10 +1,12 @@
 use std::collections::HashMap;
+use std::net::IpAddr;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use crate::parser::PacketMeta;
 use crate::analysis::flows::ConnectionFlow;
 use crate::analysis::dns_http::DnsEntry;
-use crate::analysis::utils::{is_private_ip, shannon_entropy};
+use crate::analysis::indexed::IndexedView;
+use crate::analysis::utils::{is_private_ip, is_private_addr, shannon_entropy};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AlertFinding {
@@ -61,34 +63,43 @@ impl AlertFinding {
     }
 }
 
-pub fn detect(packets: &[PacketMeta], flows: &[ConnectionFlow], dns_log: &[DnsEntry]) -> Vec<AlertFinding> {
+pub fn detect(view: &IndexedView, flows: &[ConnectionFlow], dns_log: &[DnsEntry], thresholds: &crate::config::AlertThresholds, whitelist: &crate::config::Whitelist) -> Vec<AlertFinding> {
+    // Detection runs against the shared IndexedView — each detector iterates
+    // only the protocol bucket it cares about (TCP SYNs, ICMP echo requests,
+    // etc.) instead of re-scanning the entire packet vec. Whitelisting is
+    // applied *after* detection so we never have to clone the packet slice.
     let mut findings = Vec::new();
 
     // Ported from threats.rs (with MITRE metadata)
-    findings.extend(detect_port_scan(packets));
-    findings.extend(detect_arp_spoofing(packets));
-    findings.extend(detect_icmp_sweep(packets));
-    findings.extend(detect_icmp_ping_activity(packets));
-    findings.extend(detect_icmp_flood(packets));
-    findings.extend(detect_large_icmp(packets));
-    findings.extend(detect_udp_flood(packets));
-    findings.extend(detect_suspicious_ports(packets));
-    findings.extend(detect_telnet(packets));
-    findings.extend(detect_syn_flood(packets));
-    findings.extend(detect_xmas_null_fin(packets));
-    findings.extend(detect_beaconing(packets));
-    findings.extend(detect_traffic_spikes(packets));
-    findings.extend(detect_cleartext_credentials(packets));
+    findings.extend(detect_port_scan(view, thresholds));
+    findings.extend(detect_arp_spoofing(view));
+    findings.extend(detect_icmp_sweep(view));
+    findings.extend(detect_icmp_ping_activity(view));
+    findings.extend(detect_icmp_flood(view, thresholds));
+    findings.extend(detect_large_icmp(view));
+    findings.extend(detect_udp_flood(view, thresholds));
+    findings.extend(detect_suspicious_ports(view));
+    findings.extend(detect_telnet(view));
+    findings.extend(detect_syn_flood(view, thresholds));
+    findings.extend(detect_xmas_null_fin(view));
+    findings.extend(detect_beaconing(view, thresholds));
+    findings.extend(detect_traffic_spikes(view, thresholds));
+    findings.extend(detect_cleartext_credentials(view));
 
     // New rules
-    findings.extend(detect_dns_tunneling(packets, dns_log));
-    findings.extend(detect_smb_lateral(packets));
-    findings.extend(detect_rdp_brute(packets));
-    findings.extend(detect_http_password_in_post(packets));
-    findings.extend(detect_long_lived_external_flow(flows));
-    findings.extend(detect_high_entropy_dns(dns_log));
-    findings.extend(detect_nonstandard_tls_port(packets));
-    findings.extend(detect_ldap_enumeration(packets));
+    findings.extend(detect_dns_tunneling(view, dns_log, thresholds));
+    findings.extend(detect_smb_lateral(view));
+    findings.extend(detect_rdp_brute(view));
+    findings.extend(detect_http_password_in_post(view));
+    findings.extend(detect_long_lived_external_flow(flows, whitelist));
+    findings.extend(detect_high_entropy_dns(dns_log, thresholds));
+    findings.extend(detect_nonstandard_tls_port(view));
+    findings.extend(detect_ldap_enumeration(view));
+
+    if !whitelist.ips.is_empty() {
+        let wl: std::collections::HashSet<&str> = whitelist.ips.iter().map(|s| s.as_str()).collect();
+        findings.retain(|f| !f.affected_hosts.iter().any(|h| wl.contains(h.as_str())));
+    }
 
     let sev_order = |s: &str| match s {
         "Critical" => 0,
@@ -112,24 +123,27 @@ fn first_ts(packet_indices: &[usize], packets: &[PacketMeta]) -> (f64, f64) {
 
 // ─── Ported Detectors ────────────────────────────────────────────────────────
 
-fn detect_port_scan(packets: &[PacketMeta]) -> Vec<AlertFinding> {
-    let mut syn_map: HashMap<String, HashMap<String, Vec<(u16, usize)>>> = HashMap::new();
-    let mut synack_map: HashMap<String, usize> = HashMap::new();
+fn detect_port_scan(view: &IndexedView, thresholds: &crate::config::AlertThresholds) -> Vec<AlertFinding> {
+    let mut syn_map: HashMap<IpAddr, HashMap<IpAddr, Vec<(u16, usize)>>> = HashMap::new();
+    let mut synack_map: HashMap<IpAddr, usize> = HashMap::new();
+    let mut span_map: HashMap<IpAddr, (f64, f64)> = HashMap::new();
 
-    for pkt in packets {
-        if pkt.protocol != "TCP" { continue; }
-        if let Some(layers) = &pkt.layers.transport {
-            if let Some(flags) = &layers.flags {
-                let src = pkt.src_ip.clone().unwrap_or_default();
-                let dst = pkt.dst_ip.clone().unwrap_or_default();
-                let dst_port = pkt.dst_port.unwrap_or(0);
-                if flags.contains("SYN") && !flags.contains("ACK") {
-                    syn_map.entry(src.clone()).or_default().entry(dst.clone()).or_default().push((dst_port, pkt.index));
-                }
-                if flags.contains("SYN") && flags.contains("ACK") {
-                    *synack_map.entry(dst.clone()).or_insert(0) += 1;
-                }
-            }
+    for &i in &view.tcp_syn {
+        let pkt = &view.packets[i];
+        let (src, dst) = match (pkt.src_ip, pkt.dst_ip) {
+            (Some(s), Some(d)) => (s, d),
+            _ => continue,
+        };
+        let dst_port = pkt.dst_port.unwrap_or(0);
+        syn_map.entry(src).or_default().entry(dst).or_default().push((dst_port, pkt.index));
+        let span = span_map.entry(src).or_insert((f64::INFINITY, f64::NEG_INFINITY));
+        if pkt.timestamp < span.0 { span.0 = pkt.timestamp; }
+        if pkt.timestamp > span.1 { span.1 = pkt.timestamp; }
+    }
+    for &i in &view.tcp_synack {
+        let pkt = &view.packets[i];
+        if let Some(dst) = pkt.dst_ip {
+            *synack_map.entry(dst).or_insert(0) += 1;
         }
     }
 
@@ -138,9 +152,11 @@ fn detect_port_scan(packets: &[PacketMeta]) -> Vec<AlertFinding> {
         let total_ports: usize = dst_map.values().map(|v| v.len()).sum();
         let distinct_dsts = dst_map.len();
         let synacks = synack_map.get(src).copied().unwrap_or(0);
-        if total_ports >= 20 && synacks < total_ports / 5 {
+        if total_ports >= thresholds.port_scan_syn_minimum && synacks < (total_ports as f64 * thresholds.port_scan_response_ratio) as usize {
             let packet_indices: Vec<usize> = dst_map.values().flatten().map(|(_, i)| *i).take(100).collect();
-            let (fs, ls) = first_ts(&packet_indices, packets);
+            let (fs, ls) = span_map.get(src).copied().unwrap_or((0.0, 0.0));
+            let fs = if fs.is_finite() { fs } else { 0.0 };
+            let ls = if ls.is_finite() { ls } else { 0.0 };
             let severity = if total_ports > 100 { "Critical" } else { "High" };
             findings.push(AlertFinding::new(
                 severity, "Reconnaissance",
@@ -148,7 +164,7 @@ fn detect_port_scan(packets: &[PacketMeta]) -> Vec<AlertFinding> {
                 format!("{} sent SYN packets to {} ports across {} destination(s) with only {} responses.",
                     src, total_ports, distinct_dsts, synacks),
                 fs, ls, packet_indices,
-                vec![src.clone()],
+                vec![src.to_string()],
                 "Discovery", "T1046", "Network Service Discovery", 0.85,
             ));
         }
@@ -156,17 +172,15 @@ fn detect_port_scan(packets: &[PacketMeta]) -> Vec<AlertFinding> {
     findings
 }
 
-fn detect_arp_spoofing(packets: &[PacketMeta]) -> Vec<AlertFinding> {
+fn detect_arp_spoofing(view: &IndexedView) -> Vec<AlertFinding> {
     let mut ip_mac_map: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
     let mut ip_mac_packets: HashMap<String, Vec<usize>> = HashMap::new();
 
-    for pkt in packets {
-        if pkt.protocol != "ARP" { continue; }
+    for &i in &view.arp_reply {
+        let pkt = &view.packets[i];
         if let Some(arp) = &pkt.layers.arp {
-            if arp.operation == "Reply" {
-                ip_mac_map.entry(arp.sender_ip.clone()).or_default().insert(arp.sender_mac.clone());
-                ip_mac_packets.entry(arp.sender_ip.clone()).or_default().push(pkt.index);
-            }
+            ip_mac_map.entry(arp.sender_ip.clone()).or_default().insert(arp.sender_mac.clone());
+            ip_mac_packets.entry(arp.sender_ip.clone()).or_default().push(pkt.index);
         }
     }
 
@@ -174,7 +188,7 @@ fn detect_arp_spoofing(packets: &[PacketMeta]) -> Vec<AlertFinding> {
     for (ip, macs) in &ip_mac_map {
         if macs.len() > 1 {
             let packet_indices = ip_mac_packets.get(ip).cloned().unwrap_or_default();
-            let (fs, ls) = first_ts(&packet_indices, packets);
+            let (fs, ls) = first_ts(&packet_indices, view.packets);
             findings.push(AlertFinding::new(
                 "Critical", "Network Attack",
                 format!("ARP Spoofing Detected for {}", ip),
@@ -189,27 +203,26 @@ fn detect_arp_spoofing(packets: &[PacketMeta]) -> Vec<AlertFinding> {
     findings
 }
 
-fn detect_icmp_sweep(packets: &[PacketMeta]) -> Vec<AlertFinding> {
-    let mut icmp_sources: HashMap<String, Vec<(String, usize)>> = HashMap::new();
-    for pkt in packets {
-        if pkt.protocol == "ICMP" {
-            if let (Some(src), Some(dst)) = (&pkt.src_ip, &pkt.dst_ip) {
-                icmp_sources.entry(src.clone()).or_default().push((dst.clone(), pkt.index));
-            }
+fn detect_icmp_sweep(view: &IndexedView) -> Vec<AlertFinding> {
+    let mut icmp_sources: HashMap<IpAddr, Vec<(IpAddr, usize)>> = HashMap::new();
+    for &i in &view.icmp {
+        let pkt = &view.packets[i];
+        if let (Some(src), Some(dst)) = (pkt.src_ip, pkt.dst_ip) {
+            icmp_sources.entry(src).or_default().push((dst, pkt.index));
         }
     }
 
     let mut findings = Vec::new();
     for (src, targets) in &icmp_sources {
-        let unique: std::collections::HashSet<&String> = targets.iter().map(|(ip, _)| ip).collect();
+        let unique: std::collections::HashSet<&IpAddr> = targets.iter().map(|(ip, _)| ip).collect();
         if unique.len() >= 10 {
             let packet_indices: Vec<usize> = targets.iter().map(|(_, i)| *i).take(50).collect();
-            let (fs, ls) = first_ts(&packet_indices, packets);
+            let (fs, ls) = first_ts(&packet_indices, view.packets);
             findings.push(AlertFinding::new(
                 "Medium", "Reconnaissance",
                 format!("ICMP Sweep from {}", src),
                 format!("{} sent ICMP echo requests to {} unique hosts — ping sweep.", src, unique.len()),
-                fs, ls, packet_indices, vec![src.clone()],
+                fs, ls, packet_indices, vec![src.to_string()],
                 "Discovery", "T1018", "Remote System Discovery", 0.75,
             ));
         }
@@ -217,22 +230,21 @@ fn detect_icmp_sweep(packets: &[PacketMeta]) -> Vec<AlertFinding> {
     findings
 }
 
-fn detect_icmp_ping_activity(packets: &[PacketMeta]) -> Vec<AlertFinding> {
-    let mut pairs: HashMap<(String, String), Vec<usize>> = HashMap::new();
-    for pkt in packets {
-        if pkt.protocol == "ICMP" && pkt.info.contains("Echo Request") {
-            if let (Some(src), Some(dst)) = (&pkt.src_ip, &pkt.dst_ip) {
-                pairs.entry((src.clone(), dst.clone())).or_default().push(pkt.index);
-            }
+fn detect_icmp_ping_activity(view: &IndexedView) -> Vec<AlertFinding> {
+    let mut pairs: HashMap<(IpAddr, IpAddr), Vec<usize>> = HashMap::new();
+    for &i in &view.icmp_echo_req {
+        let pkt = &view.packets[i];
+        if let (Some(src), Some(dst)) = (pkt.src_ip, pkt.dst_ip) {
+            pairs.entry((src, dst)).or_default().push(pkt.index);
         }
     }
     if pairs.is_empty() { return Vec::new(); }
 
     let total: usize = pairs.values().map(|v| v.len()).sum();
     let packet_indices: Vec<usize> = pairs.values().flatten().copied().take(50).collect();
-    let (fs, ls) = first_ts(&packet_indices, packets);
-    let sources: std::collections::HashSet<&str> = pairs.keys().map(|(s, _)| s.as_str()).collect();
-    let targets: std::collections::HashSet<&str> = pairs.keys().map(|(_, d)| d.as_str()).collect();
+    let (fs, ls) = first_ts(&packet_indices, view.packets);
+    let sources: std::collections::HashSet<IpAddr> = pairs.keys().map(|(s, _)| *s).collect();
+    let targets: std::collections::HashSet<IpAddr> = pairs.keys().map(|(_, d)| *d).collect();
 
     vec![AlertFinding::new(
         "Info", "Reconnaissance",
@@ -243,25 +255,24 @@ fn detect_icmp_ping_activity(packets: &[PacketMeta]) -> Vec<AlertFinding> {
     )]
 }
 
-fn detect_icmp_flood(packets: &[PacketMeta]) -> Vec<AlertFinding> {
-    let mut src_counts: HashMap<String, Vec<usize>> = HashMap::new();
-    for pkt in packets {
-        if pkt.protocol == "ICMP" && pkt.info.contains("Echo Request") {
-            if let Some(src) = &pkt.src_ip {
-                src_counts.entry(src.clone()).or_default().push(pkt.index);
-            }
+fn detect_icmp_flood(view: &IndexedView, thresholds: &crate::config::AlertThresholds) -> Vec<AlertFinding> {
+    let mut src_counts: HashMap<IpAddr, Vec<usize>> = HashMap::new();
+    for &i in &view.icmp_echo_req {
+        let pkt = &view.packets[i];
+        if let Some(src) = pkt.src_ip {
+            src_counts.entry(src).or_default().push(pkt.index);
         }
     }
 
     let mut findings = Vec::new();
     for (src, indices) in &src_counts {
-        if indices.len() > 50 {
-            let (fs, ls) = first_ts(indices, packets);
+        if indices.len() > thresholds.icmp_flood_minimum {
+            let (fs, ls) = first_ts(indices, view.packets);
             findings.push(AlertFinding::new(
                 "High", "DoS",
                 format!("ICMP Flood from {}", src),
-                format!("{} sent {} ICMP echo requests (threshold: 50). Possible DoS.", src, indices.len()),
-                fs, ls, indices.iter().copied().take(50).collect(), vec![src.clone()],
+                format!("{} sent {} ICMP echo requests (threshold: {}). Possible DoS.", src, indices.len(), thresholds.icmp_flood_minimum),
+                fs, ls, indices.iter().copied().take(50).collect(), vec![src.to_string()],
                 "Impact", "T1498.002", "Network Flood", 0.8,
             ));
         }
@@ -269,12 +280,13 @@ fn detect_icmp_flood(packets: &[PacketMeta]) -> Vec<AlertFinding> {
     findings
 }
 
-fn detect_large_icmp(packets: &[PacketMeta]) -> Vec<AlertFinding> {
-    let large: Vec<usize> = packets.iter()
-        .filter(|p| p.protocol == "ICMP" && p.length > 1024)
-        .map(|p| p.index).collect();
+fn detect_large_icmp(view: &IndexedView) -> Vec<AlertFinding> {
+    let large: Vec<usize> = view.icmp.iter()
+        .copied()
+        .filter(|&i| view.packets[i].length > 1024)
+        .collect();
     if large.is_empty() { return Vec::new(); }
-    let (fs, ls) = first_ts(&large, packets);
+    let (fs, ls) = first_ts(&large, view.packets);
     vec![AlertFinding::new(
         "Medium", "Exfiltration",
         "Oversized ICMP Packets Detected".to_string(),
@@ -284,25 +296,30 @@ fn detect_large_icmp(packets: &[PacketMeta]) -> Vec<AlertFinding> {
     )]
 }
 
-fn detect_udp_flood(packets: &[PacketMeta]) -> Vec<AlertFinding> {
-    let mut src_counts: HashMap<String, Vec<usize>> = HashMap::new();
-    for pkt in packets {
-        if pkt.protocol == "UDP" {
-            if let Some(src) = &pkt.src_ip {
-                src_counts.entry(src.clone()).or_default().push(pkt.index);
-            }
+fn detect_udp_flood(view: &IndexedView, thresholds: &crate::config::AlertThresholds) -> Vec<AlertFinding> {
+    let mut src_counts: HashMap<IpAddr, Vec<usize>> = HashMap::new();
+    for &i in &view.udp {
+        let pkt = &view.packets[i];
+        // UDP/443 is QUIC: a single HTTPS session generates thousands of
+        // packets in either direction, so counting it guarantees false
+        // positives on any capture with ordinary web browsing.
+        if pkt.src_port == Some(443) || pkt.dst_port == Some(443) {
+            continue;
+        }
+        if let Some(src) = pkt.src_ip {
+            src_counts.entry(src).or_default().push(pkt.index);
         }
     }
 
     let mut findings = Vec::new();
     for (src, indices) in &src_counts {
-        if indices.len() > 500 {
-            let (fs, ls) = first_ts(indices, packets);
+        if indices.len() > thresholds.udp_flood_minimum {
+            let (fs, ls) = first_ts(indices, view.packets);
             findings.push(AlertFinding::new(
                 "Medium", "DoS",
                 format!("UDP Flood from {}", src),
-                format!("{} sent {} UDP packets (threshold: 500). Possible UDP flood DoS.", src, indices.len()),
-                fs, ls, indices.iter().copied().take(50).collect(), vec![src.clone()],
+                format!("{} sent {} UDP packets (threshold: {}). Possible UDP flood DoS.", src, indices.len(), thresholds.udp_flood_minimum),
+                fs, ls, indices.iter().copied().take(50).collect(), vec![src.to_string()],
                 "Impact", "T1498.002", "Network Flood", 0.75,
             ));
         }
@@ -310,7 +327,7 @@ fn detect_udp_flood(packets: &[PacketMeta]) -> Vec<AlertFinding> {
     findings
 }
 
-fn detect_suspicious_ports(packets: &[PacketMeta]) -> Vec<AlertFinding> {
+fn detect_suspicious_ports(view: &IndexedView) -> Vec<AlertFinding> {
     let suspicious: &[(u16, &str, &str, &str)] = &[
         (4444,  "Critical", "Malware",          "Metasploit default handler"),
         (31337, "Critical", "Malware",           "Back Orifice / elite hacking"),
@@ -320,13 +337,27 @@ fn detect_suspicious_ports(packets: &[PacketMeta]) -> Vec<AlertFinding> {
         (1337,  "High",     "Malware",           "Common backdoor port"),
     ];
 
+    // Single pass over all packets bucketing matches by port — replaces the
+    // previous 6 independent O(N) scans (one per port).
+    let suspicious_set: std::collections::HashSet<u16> =
+        suspicious.iter().map(|(p, _, _, _)| *p).collect();
+    let mut matched_by_port: HashMap<u16, Vec<usize>> = HashMap::new();
+    for pkt in view.packets {
+        for port in [pkt.dst_port, pkt.src_port].into_iter().flatten() {
+            if suspicious_set.contains(&port) {
+                matched_by_port.entry(port).or_default().push(pkt.index);
+                break;
+            }
+        }
+    }
+
     let mut findings = Vec::new();
     for &(port, severity, category, label) in suspicious {
-        let matched: Vec<usize> = packets.iter()
-            .filter(|p| p.dst_port == Some(port) || p.src_port == Some(port))
-            .map(|p| p.index).collect();
-        if matched.is_empty() { continue; }
-        let (fs, ls) = first_ts(&matched, packets);
+        let matched = match matched_by_port.remove(&port) {
+            Some(m) if !m.is_empty() => m,
+            _ => continue,
+        };
+        let (fs, ls) = first_ts(&matched, view.packets);
         findings.push(AlertFinding::new(
             severity, category,
             format!("Suspicious Port {} Traffic ({})", port, label),
@@ -338,12 +369,12 @@ fn detect_suspicious_ports(packets: &[PacketMeta]) -> Vec<AlertFinding> {
     findings
 }
 
-fn detect_telnet(packets: &[PacketMeta]) -> Vec<AlertFinding> {
-    let matched: Vec<usize> = packets.iter()
+fn detect_telnet(view: &IndexedView) -> Vec<AlertFinding> {
+    let matched: Vec<usize> = view.packets.iter()
         .filter(|p| p.dst_port == Some(23) || p.src_port == Some(23))
         .map(|p| p.index).collect();
     if matched.is_empty() { return Vec::new(); }
-    let (fs, ls) = first_ts(&matched, packets);
+    let (fs, ls) = first_ts(&matched, view.packets);
     vec![AlertFinding::new(
         "High", "Cleartext Protocol",
         "Telnet Traffic Detected (Port 23)".to_string(),
@@ -353,39 +384,34 @@ fn detect_telnet(packets: &[PacketMeta]) -> Vec<AlertFinding> {
     )]
 }
 
-fn detect_syn_flood(packets: &[PacketMeta]) -> Vec<AlertFinding> {
-    let mut syn_counts: HashMap<String, Vec<usize>> = HashMap::new();
-    let mut synack_received: HashMap<String, usize> = HashMap::new();
+fn detect_syn_flood(view: &IndexedView, thresholds: &crate::config::AlertThresholds) -> Vec<AlertFinding> {
+    let mut syn_counts: HashMap<IpAddr, Vec<usize>> = HashMap::new();
+    let mut synack_received: HashMap<IpAddr, usize> = HashMap::new();
 
-    for pkt in packets {
-        if pkt.protocol != "TCP" { continue; }
-        if let Some(layers) = &pkt.layers.transport {
-            if let Some(flags) = &layers.flags {
-                if flags.contains("SYN") && !flags.contains("ACK") {
-                    if let Some(src) = &pkt.src_ip {
-                        syn_counts.entry(src.clone()).or_default().push(pkt.index);
-                    }
-                }
-                if flags.contains("SYN") && flags.contains("ACK") {
-                    if let Some(dst) = &pkt.dst_ip {
-                        *synack_received.entry(dst.clone()).or_insert(0) += 1;
-                    }
-                }
-            }
+    for &i in &view.tcp_syn {
+        let pkt = &view.packets[i];
+        if let Some(src) = pkt.src_ip {
+            syn_counts.entry(src).or_default().push(pkt.index);
+        }
+    }
+    for &i in &view.tcp_synack {
+        let pkt = &view.packets[i];
+        if let Some(dst) = pkt.dst_ip {
+            *synack_received.entry(dst).or_insert(0) += 1;
         }
     }
 
     let mut findings = Vec::new();
     for (src, indices) in &syn_counts {
-        if indices.len() <= 200 { continue; }
+        if indices.len() <= thresholds.syn_flood_minimum { continue; }
         let responses = synack_received.get(src).copied().unwrap_or(0);
         if responses < indices.len() / 10 {
-            let (fs, ls) = first_ts(indices, packets);
+            let (fs, ls) = first_ts(indices, view.packets);
             findings.push(AlertFinding::new(
                 "Critical", "DoS",
                 format!("SYN Flood from {}", src),
                 format!("{} sent {} TCP SYNs with only {} SYN-ACKs. Possible SYN flood DoS.", src, indices.len(), responses),
-                fs, ls, indices.iter().copied().take(50).collect(), vec![src.clone()],
+                fs, ls, indices.iter().copied().take(50).collect(), vec![src.to_string()],
                 "Impact", "T1498.001", "Direct Network Flood", 0.9,
             ));
         }
@@ -393,57 +419,37 @@ fn detect_syn_flood(packets: &[PacketMeta]) -> Vec<AlertFinding> {
     findings
 }
 
-fn detect_xmas_null_fin(packets: &[PacketMeta]) -> Vec<AlertFinding> {
-    let mut xmas_packets: Vec<(String, usize, f64)> = Vec::new();
-    let mut null_packets: Vec<(String, usize, f64)> = Vec::new();
-    let mut fin_packets: Vec<(String, usize, f64)> = Vec::new();
-
-    for pkt in packets {
-        if pkt.protocol != "TCP" { continue; }
-        if let Some(layers) = &pkt.layers.transport {
-            if let Some(flags) = &layers.flags {
-                let src = pkt.src_ip.clone().unwrap_or_default();
-                if flags.contains("FIN") && flags.contains("PSH") && flags.contains("URG") {
-                    xmas_packets.push((src, pkt.index, pkt.timestamp));
-                } else if flags == "NONE" {
-                    null_packets.push((src, pkt.index, pkt.timestamp));
-                } else if flags == "FIN" {
-                    fin_packets.push((src, pkt.index, pkt.timestamp));
-                }
-            }
-        }
-    }
-
+fn detect_xmas_null_fin(view: &IndexedView) -> Vec<AlertFinding> {
     let mut findings = Vec::new();
-    if !xmas_packets.is_empty() {
-        let indices: Vec<usize> = xmas_packets.iter().map(|(_, i, _)| *i).take(50).collect();
-        let (fs, ls) = first_ts(&indices, packets);
+    if !view.tcp_xmas.is_empty() {
+        let indices: Vec<usize> = view.tcp_xmas.iter().copied().take(50).collect();
+        let (fs, ls) = first_ts(&indices, view.packets);
         findings.push(AlertFinding::new(
             "High", "Reconnaissance",
             "Xmas Scan Detected".to_string(),
-            format!("{} Xmas scan packets (FIN+PSH+URG). Used to probe open ports.", xmas_packets.len()),
+            format!("{} Xmas scan packets (FIN+PSH+URG). Used to probe open ports.", view.tcp_xmas.len()),
             fs, ls, indices, Vec::new(),
             "Discovery", "T1046", "Network Service Discovery", 0.9,
         ));
     }
-    if null_packets.len() >= 5 {
-        let indices: Vec<usize> = null_packets.iter().map(|(_, i, _)| *i).take(50).collect();
-        let (fs, ls) = first_ts(&indices, packets);
+    if view.tcp_null.len() >= 5 {
+        let indices: Vec<usize> = view.tcp_null.iter().copied().take(50).collect();
+        let (fs, ls) = first_ts(&indices, view.packets);
         findings.push(AlertFinding::new(
             "High", "Reconnaissance",
             "NULL Scan Detected".to_string(),
-            format!("{} NULL scan packets (no TCP flags). Evades stateless firewalls.", null_packets.len()),
+            format!("{} NULL scan packets (no TCP flags). Evades stateless firewalls.", view.tcp_null.len()),
             fs, ls, indices, Vec::new(),
             "Discovery", "T1046", "Network Service Discovery", 0.85,
         ));
     }
-    if fin_packets.len() >= 5 {
-        let indices: Vec<usize> = fin_packets.iter().map(|(_, i, _)| *i).take(50).collect();
-        let (fs, ls) = first_ts(&indices, packets);
+    if view.tcp_fin_only.len() >= 5 {
+        let indices: Vec<usize> = view.tcp_fin_only.iter().copied().take(50).collect();
+        let (fs, ls) = first_ts(&indices, view.packets);
         findings.push(AlertFinding::new(
             "Medium", "Reconnaissance",
             "FIN Scan Detected".to_string(),
-            format!("{} isolated FIN packets without SYN/ACK. FIN scan technique.", fin_packets.len()),
+            format!("{} isolated FIN packets without SYN/ACK. FIN scan technique.", view.tcp_fin_only.len()),
             fs, ls, indices, Vec::new(),
             "Discovery", "T1046", "Network Service Discovery", 0.75,
         ));
@@ -451,45 +457,39 @@ fn detect_xmas_null_fin(packets: &[PacketMeta]) -> Vec<AlertFinding> {
     findings
 }
 
-fn detect_beaconing(packets: &[PacketMeta]) -> Vec<AlertFinding> {
-    let mut conn_times: HashMap<(String, String), Vec<f64>> = HashMap::new();
-    let mut conn_packets: HashMap<(String, String), Vec<usize>> = HashMap::new();
+fn detect_beaconing(view: &IndexedView, thresholds: &crate::config::AlertThresholds) -> Vec<AlertFinding> {
+    let mut conn_times: HashMap<(IpAddr, IpAddr), Vec<f64>> = HashMap::new();
+    let mut conn_packets: HashMap<(IpAddr, IpAddr), Vec<usize>> = HashMap::new();
 
-    for pkt in packets {
-        if pkt.protocol != "TCP" { continue; }
-        if let Some(layers) = &pkt.layers.transport {
-            if let Some(flags) = &layers.flags {
-                if flags.contains("SYN") && !flags.contains("ACK") {
-                    if let (Some(src), Some(dst)) = (&pkt.src_ip, &pkt.dst_ip) {
-                        if !is_private_ip(dst) {
-                            let key = (src.clone(), dst.clone());
-                            conn_times.entry(key.clone()).or_default().push(pkt.timestamp);
-                            conn_packets.entry(key).or_default().push(pkt.index);
-                        }
-                    }
-                }
+    for &i in &view.tcp_syn {
+        let pkt = &view.packets[i];
+        if let (Some(src), Some(dst)) = (pkt.src_ip, pkt.dst_ip) {
+            if !is_private_addr(&dst) {
+                let key = (src, dst);
+                conn_times.entry(key).or_default().push(pkt.timestamp);
+                conn_packets.entry(key).or_default().push(pkt.index);
             }
         }
     }
 
     let mut findings = Vec::new();
     for ((src, dst), mut times) in conn_times {
-        if times.len() < 5 { continue; }
-        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        if times.len() < thresholds.beaconing_min_connections { continue; }
+        times.sort_by(|a, b| a.total_cmp(b));
         let intervals: Vec<f64> = times.windows(2).map(|w| w[1] - w[0]).collect();
         let mean = intervals.iter().sum::<f64>() / intervals.len() as f64;
         let variance = intervals.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / intervals.len() as f64;
         let cv = if mean > 0.0 { variance.sqrt() / mean } else { f64::INFINITY };
-        if cv < 0.2 && mean > 1.0 && mean < 3600.0 {
-            let packet_indices = conn_packets.get(&(src.clone(), dst.clone())).cloned().unwrap_or_default();
-            let (fs, ls) = first_ts(&packet_indices, packets);
+        if cv < thresholds.beaconing_max_cv && mean > 1.0 && mean < 3600.0 {
+            let packet_indices = conn_packets.get(&(src, dst)).cloned().unwrap_or_default();
+            let (fs, ls) = first_ts(&packet_indices, view.packets);
             findings.push(AlertFinding::new(
                 "High", "Command & Control",
                 format!("Beaconing Behavior: {} → {}", src, dst),
                 format!("{} → {} connected {} times at ~{:.1}s intervals (jitter CV: {:.3}). Possible C2 callback.",
                     src, dst, times.len(), mean, cv),
                 fs, ls, packet_indices.into_iter().take(50).collect(),
-                vec![src.clone(), dst.clone()],
+                vec![src.to_string(), dst.to_string()],
                 "Command and Control", "T1071.001", "Application Layer Protocol: Web Protocols", 0.85,
             ));
         }
@@ -497,31 +497,31 @@ fn detect_beaconing(packets: &[PacketMeta]) -> Vec<AlertFinding> {
     findings
 }
 
-fn detect_traffic_spikes(packets: &[PacketMeta]) -> Vec<AlertFinding> {
-    if packets.is_empty() { return Vec::new(); }
-    let mut bytes_per_ip: HashMap<String, usize> = HashMap::new();
-    let mut packets_per_ip: HashMap<String, Vec<usize>> = HashMap::new();
-    let total_bytes: usize = packets.iter().map(|p| p.length).sum();
+fn detect_traffic_spikes(view: &IndexedView, thresholds: &crate::config::AlertThresholds) -> Vec<AlertFinding> {
+    if view.packets.is_empty() { return Vec::new(); }
+    let mut bytes_per_ip: HashMap<IpAddr, usize> = HashMap::new();
+    let mut packets_per_ip: HashMap<IpAddr, Vec<usize>> = HashMap::new();
+    let total_bytes: usize = view.packets.iter().map(|p| p.length).sum();
 
-    for pkt in packets {
-        if let Some(src) = &pkt.src_ip {
-            *bytes_per_ip.entry(src.clone()).or_insert(0) += pkt.length;
-            packets_per_ip.entry(src.clone()).or_default().push(pkt.index);
+    for pkt in view.packets {
+        if let Some(src) = pkt.src_ip {
+            *bytes_per_ip.entry(src).or_insert(0) += pkt.length;
+            packets_per_ip.entry(src).or_default().push(pkt.index);
         }
     }
 
     let mut findings = Vec::new();
     for (ip, bytes) in &bytes_per_ip {
         let pct = *bytes as f64 / total_bytes as f64;
-        if pct > 0.5 && bytes_per_ip.len() > 2 {
+        if pct > thresholds.traffic_spike_percentage && bytes_per_ip.len() > 2 {
             let packet_indices = packets_per_ip.get(ip).cloned().unwrap_or_default();
-            let (fs, ls) = first_ts(&packet_indices, packets);
+            let (fs, ls) = first_ts(&packet_indices, view.packets);
             findings.push(AlertFinding::new(
                 "Medium", "Anomalous Traffic",
                 format!("Abnormal Traffic Volume from {}", ip),
                 format!("{} is responsible for {:.1}% of all traffic ({} bytes). Possible exfiltration or DoS.",
                     ip, pct * 100.0, bytes),
-                fs, ls, packet_indices.into_iter().take(50).collect(), vec![ip.clone()],
+                fs, ls, packet_indices.into_iter().take(50).collect(), vec![ip.to_string()],
                 "Exfiltration", "T1030", "Data Transfer Size Limits", 0.6,
             ));
         }
@@ -529,42 +529,37 @@ fn detect_traffic_spikes(packets: &[PacketMeta]) -> Vec<AlertFinding> {
     findings
 }
 
-fn detect_cleartext_credentials(packets: &[PacketMeta]) -> Vec<AlertFinding> {
+fn detect_cleartext_credentials(view: &IndexedView) -> Vec<AlertFinding> {
     let mut findings = Vec::new();
 
-    for pkt in packets {
-        if let Some(app) = &pkt.layers.application {
-            if app.protocol == "HTTP" {
-                if let Some(headers) = app.data.get("headers") {
-                    if let Some(auth) = headers.get("Authorization") {
-                        if auth.as_str().unwrap_or("").starts_with("Basic ") {
-                            findings.push(AlertFinding::new(
-                                "High", "Credential Exposure",
-                                format!("HTTP Basic Auth Credentials in Cleartext (Packet #{})", pkt.index),
-                                format!("Packet #{} contains HTTP Basic Auth header transmitting credentials in plaintext.", pkt.index),
-                                pkt.timestamp, pkt.timestamp, vec![pkt.index],
-                                pkt.src_ip.as_ref().map(|ip| vec![ip.clone()]).unwrap_or_default(),
-                                "Credential Access", "T1552.001", "Credentials In Files", 0.95,
-                            ));
-                        }
-                    }
-                }
-            }
+    // HTTP Basic Auth check — only iterate the http bucket.
+    for &i in &view.http {
+        let pkt = &view.packets[i];
+        let Some(app) = &pkt.layers.application else { continue };
+        let Some(headers) = app.data.get("headers") else { continue };
+        let Some(auth) = headers.get("Authorization") else { continue };
+        if auth.as_str().unwrap_or("").starts_with("Basic ") {
+            findings.push(AlertFinding::new(
+                "High", "Credential Exposure",
+                format!("HTTP Basic Auth Credentials in Cleartext (Packet #{})", pkt.index),
+                format!("Packet #{} contains HTTP Basic Auth header transmitting credentials in plaintext.", pkt.index),
+                pkt.timestamp, pkt.timestamp, vec![pkt.index],
+                pkt.src_ip.map(|ip| vec![ip.to_string()]).unwrap_or_default(),
+                "Credential Access", "T1552.001", "Credentials In Files", 0.95,
+            ));
         }
-        if pkt.protocol == "TCP" {
-            if let (Some(sp), Some(dp)) = (pkt.src_port, pkt.dst_port) {
-                if sp == 21 || dp == 21 {
-                    findings.push(AlertFinding::new(
-                        "High", "Credential Exposure",
-                        "FTP Session Detected (Cleartext Protocol)".to_string(),
-                        "FTP traffic observed — transmits credentials in plaintext.".to_string(),
-                        pkt.timestamp, pkt.timestamp, vec![pkt.index], Vec::new(),
-                        "Credential Access", "T1552.001", "Credentials In Files", 0.9,
-                    ));
-                    break;
-                }
-            }
-        }
+    }
+    // FTP cleartext check — fire on the first matching TCP packet.
+    if let Some(pkt) = view.tcp.iter().map(|&i| &view.packets[i])
+        .find(|p| matches!(p.src_port, Some(21)) || matches!(p.dst_port, Some(21)))
+    {
+        findings.push(AlertFinding::new(
+            "High", "Credential Exposure",
+            "FTP Session Detected (Cleartext Protocol)".to_string(),
+            "FTP traffic observed — transmits credentials in plaintext.".to_string(),
+            pkt.timestamp, pkt.timestamp, vec![pkt.index], Vec::new(),
+            "Credential Access", "T1552.001", "Credentials In Files", 0.9,
+        ));
     }
     findings.dedup_by(|a, b| a.title == b.title);
     findings
@@ -572,7 +567,7 @@ fn detect_cleartext_credentials(packets: &[PacketMeta]) -> Vec<AlertFinding> {
 
 // ─── New Detection Rules ─────────────────────────────────────────────────────
 
-fn detect_dns_tunneling(packets: &[PacketMeta], dns_log: &[DnsEntry]) -> Vec<AlertFinding> {
+fn detect_dns_tunneling(view: &IndexedView, dns_log: &[DnsEntry], thresholds: &crate::config::AlertThresholds) -> Vec<AlertFinding> {
     let mut apex_counts: HashMap<String, usize> = HashMap::new();
     let mut suspicious_packets: Vec<usize> = Vec::new();
     let mut sources: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -590,7 +585,7 @@ fn detect_dns_tunneling(packets: &[PacketMeta], dns_log: &[DnsEntry]) -> Vec<Ale
             name.clone()
         };
 
-        let is_suspicious = longest_label > 50 || depth > 5 || (entropy > 3.5 && longest_label > 12);
+        let is_suspicious = longest_label > thresholds.dns_tunnel_label_length || depth > 5 || (entropy > thresholds.dns_tunnel_entropy && longest_label > 12);
         if is_suspicious {
             suspicious_packets.push(entry.packet_index);
             sources.insert(entry.src_ip.clone());
@@ -599,7 +594,7 @@ fn detect_dns_tunneling(packets: &[PacketMeta], dns_log: &[DnsEntry]) -> Vec<Ale
     }
 
     if suspicious_packets.len() >= 3 {
-        let (fs, ls) = first_ts(&suspicious_packets, packets);
+        let (fs, ls) = first_ts(&suspicious_packets, view.packets);
         vec![AlertFinding::new(
             "High", "Exfiltration",
             "DNS Tunneling Indicators Detected".to_string(),
@@ -614,36 +609,38 @@ fn detect_dns_tunneling(packets: &[PacketMeta], dns_log: &[DnsEntry]) -> Vec<Ale
     }
 }
 
-fn detect_smb_lateral(packets: &[PacketMeta]) -> Vec<AlertFinding> {
+fn detect_smb_lateral(view: &IndexedView) -> Vec<AlertFinding> {
     let smb_ports = [445u16, 139, 137];
     let mut lateral_packets: Vec<usize> = Vec::new();
-    let mut pairs: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut pairs: std::collections::HashSet<(IpAddr, IpAddr)> = std::collections::HashSet::new();
 
-    for pkt in packets {
+    for pkt in view.packets {
         let dp = pkt.dst_port.unwrap_or(0);
         if !smb_ports.contains(&dp) { continue; }
-        if let (Some(src), Some(dst)) = (&pkt.src_ip, &pkt.dst_ip) {
-            if is_private_ip(src) && is_private_ip(dst) {
-                // Check different subnets (/24)
-                let src_net: Vec<&str> = src.split('.').collect();
-                let dst_net: Vec<&str> = dst.split('.').collect();
-                if src_net.len() == 4 && dst_net.len() == 4 && src_net[2] != dst_net[2] {
+        if let (Some(src), Some(dst)) = (pkt.src_ip, pkt.dst_ip) {
+            if is_private_addr(&src) && is_private_addr(&dst) {
+                // Check different /24 networks. Only meaningful for IPv4.
+                let crosses_subnet = match (src, dst) {
+                    (IpAddr::V4(s), IpAddr::V4(d)) => s.octets()[2] != d.octets()[2],
+                    _ => false,
+                };
+                if crosses_subnet {
                     lateral_packets.push(pkt.index);
-                    pairs.insert((src.clone(), dst.clone()));
+                    pairs.insert((src, dst));
                 }
             }
         }
     }
 
     if lateral_packets.len() >= 5 {
-        let (fs, ls) = first_ts(&lateral_packets, packets);
+        let (fs, ls) = first_ts(&lateral_packets, view.packets);
         vec![AlertFinding::new(
             "High", "Lateral Movement",
             "SMB Lateral Movement Detected".to_string(),
             format!("{} SMB packets (ports 445/139/137) crossing RFC1918 subnets across {} pairs. Possible lateral movement.",
                 lateral_packets.len(), pairs.len()),
             fs, ls, lateral_packets.into_iter().take(50).collect(),
-            pairs.into_iter().flat_map(|(s, d)| vec![s, d]).collect(),
+            pairs.into_iter().flat_map(|(s, d)| vec![s.to_string(), d.to_string()]).collect(),
             "Lateral Movement", "T1021.002", "Remote Services: SMB/Windows Admin Shares", 0.8,
         )]
     } else {
@@ -651,31 +648,25 @@ fn detect_smb_lateral(packets: &[PacketMeta]) -> Vec<AlertFinding> {
     }
 }
 
-fn detect_rdp_brute(packets: &[PacketMeta]) -> Vec<AlertFinding> {
-    let mut syn_per_src: HashMap<String, Vec<usize>> = HashMap::new();
-    for pkt in packets {
+fn detect_rdp_brute(view: &IndexedView) -> Vec<AlertFinding> {
+    let mut syn_per_src: HashMap<IpAddr, Vec<usize>> = HashMap::new();
+    for &i in &view.tcp_syn {
+        let pkt = &view.packets[i];
         if pkt.dst_port != Some(3389) { continue; }
-        if pkt.protocol != "TCP" { continue; }
-        if let Some(layers) = &pkt.layers.transport {
-            if let Some(flags) = &layers.flags {
-                if flags.contains("SYN") && !flags.contains("ACK") {
-                    if let Some(src) = &pkt.src_ip {
-                        syn_per_src.entry(src.clone()).or_default().push(pkt.index);
-                    }
-                }
-            }
+        if let Some(src) = pkt.src_ip {
+            syn_per_src.entry(src).or_default().push(pkt.index);
         }
     }
 
     let mut findings = Vec::new();
     for (src, indices) in &syn_per_src {
         if indices.len() >= 10 {
-            let (fs, ls) = first_ts(indices, packets);
+            let (fs, ls) = first_ts(indices, view.packets);
             findings.push(AlertFinding::new(
                 "High", "Credential Access",
                 format!("RDP Brute Force from {}", src),
                 format!("{} SYN packets to RDP port 3389 from {}. Possible brute force attempt.", indices.len(), src),
-                fs, ls, indices.iter().copied().take(50).collect(), vec![src.clone()],
+                fs, ls, indices.iter().copied().take(50).collect(), vec![src.to_string()],
                 "Credential Access", "T1110", "Brute Force", 0.8,
             ));
         }
@@ -683,53 +674,50 @@ fn detect_rdp_brute(packets: &[PacketMeta]) -> Vec<AlertFinding> {
     findings
 }
 
-fn detect_http_password_in_post(packets: &[PacketMeta]) -> Vec<AlertFinding> {
+fn detect_http_password_in_post(view: &IndexedView) -> Vec<AlertFinding> {
     let keywords = ["password=", "passwd=", "pwd=", "pass="];
     let mut findings = Vec::new();
 
-    for pkt in packets {
-        if let Some(app) = &pkt.layers.application {
-            if app.protocol == "HTTP" {
-                let method = app.data["method"].as_str().unwrap_or("");
-                if method == "POST" {
-                    // Check app payload preview for password fields
-                    let preview_hex = &pkt.app_payload_preview;
-                    if let Ok(bytes) = (0..preview_hex.len())
-                        .step_by(2)
-                        .map(|i| u8::from_str_radix(&preview_hex[i..i+2], 16))
-                        .collect::<Result<Vec<u8>, _>>()
-                    {
-                        if let Ok(text) = std::str::from_utf8(&bytes) {
-                            let lower = text.to_lowercase();
-                            for kw in keywords {
-                                if lower.contains(kw) {
-                                    findings.push(AlertFinding::new(
-                                        "High", "Credential Exposure",
-                                        format!("HTTP POST Contains Password Field (Packet #{})", pkt.index),
-                                        format!("POST body contains '{}' keyword — credentials transmitted in cleartext HTTP.", kw),
-                                        pkt.timestamp, pkt.timestamp, vec![pkt.index],
-                                        pkt.src_ip.as_ref().map(|ip| vec![ip.clone()]).unwrap_or_default(),
-                                        "Credential Access", "T1552.001", "Credentials In Files", 0.85,
-                                    ));
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
+    for &i in &view.http {
+        let pkt = &view.packets[i];
+        let Some(app) = &pkt.layers.application else { continue };
+        let method = app.data.get("method").and_then(|v| v.as_str()).unwrap_or("");
+        if method != "POST" { continue; }
+        let preview_hex = &pkt.app_payload_preview;
+        // Guard against odd-length hex strings (would panic on slice).
+        let hex_len = preview_hex.len() & !1;
+        let Ok(bytes) = (0..hex_len)
+            .step_by(2)
+            .map(|j| u8::from_str_radix(&preview_hex[j..j+2], 16))
+            .collect::<Result<Vec<u8>, _>>()
+        else { continue };
+        let Ok(text) = std::str::from_utf8(&bytes) else { continue };
+        let lower = text.to_lowercase();
+        for kw in keywords {
+            if lower.contains(kw) {
+                findings.push(AlertFinding::new(
+                    "High", "Credential Exposure",
+                    format!("HTTP POST Contains Password Field (Packet #{})", pkt.index),
+                    format!("POST body contains '{}' keyword — credentials transmitted in cleartext HTTP.", kw),
+                    pkt.timestamp, pkt.timestamp, vec![pkt.index],
+                    pkt.src_ip.map(|ip| vec![ip.to_string()]).unwrap_or_default(),
+                    "Credential Access", "T1552.001", "Credentials In Files", 0.85,
+                ));
+                break;
             }
         }
     }
     findings
 }
 
-fn detect_long_lived_external_flow(flows: &[ConnectionFlow]) -> Vec<AlertFinding> {
+fn detect_long_lived_external_flow(flows: &[ConnectionFlow], whitelist: &crate::config::Whitelist) -> Vec<AlertFinding> {
     let threshold = 30.0 * 60.0; // 30 minutes
     let mut findings = Vec::new();
 
     for flow in flows {
         let duration = flow.last_seen - flow.first_seen;
-        if duration >= threshold && !is_private_ip(&flow.dst_ip) {
+        let wl_ip = whitelist.ips.iter().any(|ip| ip == &flow.src_ip || ip == &flow.dst_ip);
+        if duration >= threshold && !is_private_ip(&flow.dst_ip) && !wl_ip {
             findings.push(AlertFinding {
                 id: Uuid::new_v4().to_string(),
                 severity: "Medium".to_string(),
@@ -753,17 +741,21 @@ fn detect_long_lived_external_flow(flows: &[ConnectionFlow]) -> Vec<AlertFinding
     findings
 }
 
-fn detect_high_entropy_dns(dns_log: &[DnsEntry]) -> Vec<AlertFinding> {
+fn detect_high_entropy_dns(dns_log: &[DnsEntry], thresholds: &crate::config::AlertThresholds) -> Vec<AlertFinding> {
     let mut suspicious: Vec<usize> = Vec::new();
     let mut domains: Vec<String> = Vec::new();
+    let mut first_seen = f64::INFINITY;
+    let mut last_seen = f64::NEG_INFINITY;
 
     for entry in dns_log {
         if entry.is_response { continue; }
         let labels: Vec<&str> = entry.name.split('.').collect();
         for label in &labels {
-            if label.len() > 12 && shannon_entropy(label) > 3.5 {
+            if label.len() > 12 && shannon_entropy(label) > thresholds.dns_tunnel_entropy {
                 suspicious.push(entry.packet_index);
                 domains.push(entry.name.clone());
+                if entry.timestamp < first_seen { first_seen = entry.timestamp; }
+                if entry.timestamp > last_seen { last_seen = entry.timestamp; }
                 break;
             }
         }
@@ -775,10 +767,10 @@ fn detect_high_entropy_dns(dns_log: &[DnsEntry]) -> Vec<AlertFinding> {
             severity: "Medium".to_string(),
             category: "Command & Control".to_string(),
             title: "High-Entropy DNS Labels Detected".to_string(),
-            description: format!("{} DNS queries with high-entropy labels (entropy >3.5, length >12). May indicate DGA or DNS-based C2.",
-                suspicious.len()),
-            first_seen: 0.0,
-            last_seen: 0.0,
+            description: format!("{} DNS queries with high-entropy labels (entropy >{:.1}, length >12). May indicate DGA or DNS-based C2.",
+                suspicious.len(), thresholds.dns_tunnel_entropy),
+            first_seen: if first_seen.is_finite() { first_seen } else { 0.0 },
+            last_seen: if last_seen.is_finite() { last_seen } else { 0.0 },
             packet_indices: suspicious.into_iter().take(50).collect(),
             affected_hosts: Vec::new(),
             mitre_tactic: "Command and Control".to_string(),
@@ -793,23 +785,28 @@ fn detect_high_entropy_dns(dns_log: &[DnsEntry]) -> Vec<AlertFinding> {
     }
 }
 
-fn detect_nonstandard_tls_port(packets: &[PacketMeta]) -> Vec<AlertFinding> {
+fn detect_nonstandard_tls_port(view: &IndexedView) -> Vec<AlertFinding> {
     let standard_tls_ports = [443u16, 8443, 465, 993, 995, 8080, 4433];
     let mut suspicious: Vec<usize> = Vec::new();
     let mut ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    let mut first_seen = f64::INFINITY;
+    let mut last_seen = f64::NEG_INFINITY;
 
-    for pkt in packets {
-        if pkt.protocol != "TLS" { continue; }
+    for &i in &view.tls {
+        let pkt = &view.packets[i];
         let dp = pkt.dst_port.unwrap_or(0);
         let sp = pkt.src_port.unwrap_or(0);
         if !standard_tls_ports.contains(&dp) && !standard_tls_ports.contains(&sp) {
             suspicious.push(pkt.index);
             ports.insert(dp);
+            if pkt.timestamp < first_seen { first_seen = pkt.timestamp; }
+            if pkt.timestamp > last_seen { last_seen = pkt.timestamp; }
         }
     }
 
     if !suspicious.is_empty() {
-        let (fs, ls) = (0.0f64, 0.0f64);
+        let fs = if first_seen.is_finite() { first_seen } else { 0.0 };
+        let ls = if last_seen.is_finite() { last_seen } else { 0.0 };
         vec![AlertFinding::new(
             "Medium", "Command & Control",
             format!("TLS on Non-Standard Port(s): {:?}", ports.iter().collect::<Vec<_>>()),
@@ -822,15 +819,15 @@ fn detect_nonstandard_tls_port(packets: &[PacketMeta]) -> Vec<AlertFinding> {
     }
 }
 
-fn detect_ldap_enumeration(packets: &[PacketMeta]) -> Vec<AlertFinding> {
+fn detect_ldap_enumeration(view: &IndexedView) -> Vec<AlertFinding> {
     let ldap_ports = [389u16, 636, 3268, 3269];
-    let mut src_counts: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut src_counts: HashMap<IpAddr, Vec<usize>> = HashMap::new();
 
-    for pkt in packets {
+    for pkt in view.packets {
         let dp = pkt.dst_port.unwrap_or(0);
         if ldap_ports.contains(&dp) {
-            if let Some(src) = &pkt.src_ip {
-                src_counts.entry(src.clone()).or_default().push(pkt.index);
+            if let Some(src) = pkt.src_ip {
+                src_counts.entry(src).or_default().push(pkt.index);
             }
         }
     }
@@ -838,13 +835,13 @@ fn detect_ldap_enumeration(packets: &[PacketMeta]) -> Vec<AlertFinding> {
     let mut findings = Vec::new();
     for (src, indices) in &src_counts {
         if indices.len() >= 20 {
-            let (fs, ls) = first_ts(indices, packets);
+            let (fs, ls) = first_ts(indices, view.packets);
             findings.push(AlertFinding::new(
                 "Medium", "Reconnaissance",
                 format!("LDAP Enumeration from {}", src),
                 format!("{} LDAP packets (port 389/636) from {}. High-volume LDAP may indicate directory enumeration.",
                     indices.len(), src),
-                fs, ls, indices.iter().copied().take(50).collect(), vec![src.clone()],
+                fs, ls, indices.iter().copied().take(50).collect(), vec![src.to_string()],
                 "Discovery", "T1018", "Remote System Discovery", 0.7,
             ));
         }

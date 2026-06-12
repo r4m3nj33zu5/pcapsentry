@@ -1,7 +1,8 @@
 use std::collections::HashMap;
+use std::net::IpAddr;
 use serde::{Deserialize, Serialize};
 use crate::parser::PacketMeta;
-use crate::analysis::utils::{flow_id, is_private_ip};
+use crate::analysis::utils::{flow_id, is_private_addr};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConnectionFlow {
@@ -28,8 +29,8 @@ pub struct ConnectionFlow {
 pub fn compute(packets: &[PacketMeta]) -> Vec<ConnectionFlow> {
     #[derive(Eq, PartialEq, Hash)]
     struct FlowKey {
-        src_ip: String,
-        dst_ip: String,
+        src_ip: IpAddr,
+        dst_ip: IpAddr,
         dst_port: Option<u16>,
         protocol: String,
     }
@@ -50,8 +51,8 @@ pub fn compute(packets: &[PacketMeta]) -> Vec<ConnectionFlow> {
     let mut map: HashMap<FlowKey, FlowData> = HashMap::new();
 
     for pkt in packets {
-        let src_ip = match &pkt.src_ip { Some(ip) => ip.clone(), None => continue };
-        let dst_ip = match &pkt.dst_ip { Some(ip) => ip.clone(), None => continue };
+        let src_ip = match pkt.src_ip { Some(ip) => ip, None => continue };
+        let dst_ip = match pkt.dst_ip { Some(ip) => ip, None => continue };
 
         let key = FlowKey {
             src_ip,
@@ -115,12 +116,14 @@ pub fn compute(packets: &[PacketMeta]) -> Vec<ConnectionFlow> {
             };
 
             let service = guess_service(k.dst_port);
-            let is_suspicious = !is_private_ip(&k.dst_ip) && duration > 1800.0;
-            let fid = flow_id(&k.src_ip, &k.dst_ip, Some(v.src_port.unwrap_or(0)), k.dst_port, &k.protocol);
+            let is_suspicious = !is_private_addr(&k.dst_ip) && duration > 1800.0;
+            let src_str = k.src_ip.to_string();
+            let dst_str = k.dst_ip.to_string();
+            let fid = flow_id(&src_str, &dst_str, Some(v.src_port.unwrap_or(0)), k.dst_port, &k.protocol);
 
             ConnectionFlow {
-                src_ip: k.src_ip,
-                dst_ip: k.dst_ip,
+                src_ip: src_str,
+                dst_ip: dst_str,
                 src_port: v.src_port,
                 dst_port: k.dst_port,
                 protocol: k.protocol,
@@ -145,7 +148,7 @@ pub fn compute(packets: &[PacketMeta]) -> Vec<ConnectionFlow> {
     flows
 }
 
-fn guess_service(port: Option<u16>) -> &'static str {
+pub(crate) fn guess_service(port: Option<u16>) -> &'static str {
     match port {
         Some(80) => "HTTP",
         Some(443) => "HTTPS",
