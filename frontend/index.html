@@ -6,14 +6,35 @@
     <title>PcapSentry</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet" />
+    <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=Oxanium:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="preconnect" href="https://api.fontshare.com" />
+    <link href="https://api.fontshare.com/v2/css?f[]=satoshi@400,500,700&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <style>
+      :root {
+        --font-display: 'Syne', sans-serif;
+        --font-body: 'Satoshi', 'Inter', system-ui, sans-serif;
+        --font-ui: 'Oxanium', 'Syne', sans-serif;
+        --bg: #000000;
+        --bg-surface: #050508;
+        --bg-overlay: rgba(10, 40, 80, 0.18);
+        --text: #f0f0f0;
+        --text-muted: #505060;
+        --text-dim: #30303a;
+        --border: rgba(255,255,255,0.06);
+        --border-hover: rgba(255,255,255,0.18);
+        --accent: #c8d8f0;
+        --critical: #e03e5a;
+        --high: #d4622c;
+        --medium: #c8920a;
+        --low: #4ade80;
+        --info: #c8d8f0;
+      }
       *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-      html, body { height: 100%; background: #000000; color: #f0f0f0; font-family: 'Inter', system-ui, sans-serif; }
-      ::-webkit-scrollbar { width: 5px; height: 5px; }
+      html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--font-body); }
+      ::-webkit-scrollbar { width: 4px; height: 4px; }
       ::-webkit-scrollbar-track { background: #000000; }
-      ::-webkit-scrollbar-thumb { background: #2a2a2a; border-radius: 0; }
+      ::-webkit-scrollbar-thumb { background: #1a1a28; border-radius: 0; }
     </style>
   </head>
   <body>

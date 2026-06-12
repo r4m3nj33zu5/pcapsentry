@@ -15,6 +15,7 @@
   $: protocols = ['All', ...new Set(packets.map(p => p.protocol || 'OTHER'))];
 
   $: filtered = packets.filter((p, i) => {
+    if (filter.focusPacketSet && !filter.focusPacketSet.has(i)) return false;
     if (filter.focusIp && p.src_ip !== filter.focusIp && p.dst_ip !== filter.focusIp) return false;
     if (showMarkedOnly && !filter.markedPackets?.has(i)) return false;
     if (protoFilter !== 'All' && (p.protocol || 'OTHER') !== protoFilter) return false;

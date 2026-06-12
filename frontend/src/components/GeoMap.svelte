@@ -46,15 +46,30 @@
         opacity: 0.9,
       });
 
-      marker.bindPopup(`
-        <div style="font-family:system-ui;font-size:12px;line-height:1.6;background:#111111;color:#f0f0f0;padding:4px">
-          <strong style="color:#c8d8f0">${pt.ip}</strong><br/>
-          ${pt.city ? pt.city + ', ' : ''}${pt.country}<br/>
-          Packets: ${pt.packet_count.toLocaleString()}<br/>
-          Bytes: ${fmtBytes(pt.bytes)}
-          ${isThreat ? '<br/><span style="color:#e03e5a">⚠ Threat Indicator</span>' : ''}
-        </div>
-      `);
+      // Build the popup with DOM APIs so pcap-derived strings (IP, city,
+      // country) cannot inject HTML. Leaflet's bindPopup accepts a DOM node.
+      const popup = document.createElement('div');
+      popup.style.cssText = 'font-family:system-ui;font-size:12px;line-height:1.6;background:#111111;color:#f0f0f0;padding:4px';
+      const ipEl = document.createElement('strong');
+      ipEl.style.color = '#c8d8f0';
+      ipEl.textContent = pt.ip;
+      popup.appendChild(ipEl);
+      popup.appendChild(document.createElement('br'));
+      const loc = document.createElement('span');
+      loc.textContent = (pt.city ? pt.city + ', ' : '') + (pt.country || '');
+      popup.appendChild(loc);
+      popup.appendChild(document.createElement('br'));
+      const counts = document.createElement('span');
+      counts.textContent = `Packets: ${pt.packet_count.toLocaleString()} · Bytes: ${fmtBytes(pt.bytes)}`;
+      popup.appendChild(counts);
+      if (isThreat) {
+        popup.appendChild(document.createElement('br'));
+        const warn = document.createElement('span');
+        warn.style.color = '#e03e5a';
+        warn.textContent = '⚠ Threat Indicator';
+        popup.appendChild(warn);
+      }
+      marker.bindPopup(popup);
 
       marker.addTo(map);
     }

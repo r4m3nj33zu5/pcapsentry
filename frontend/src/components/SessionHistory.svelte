@@ -59,20 +59,21 @@
   .toggle { display: none; }
   .sidebar-header {
     padding: 1rem 0.75rem 0.5rem;
-    font-size: 0.65rem;
-    font-weight: 700;
-    font-family: 'Syne', 'Inter', sans-serif;
-    color: #383838;
+    font-size: 0.58rem;
+    font-weight: 600;
+    font-family: var(--font-ui);
+    color: var(--text-dim);
     text-transform: uppercase;
-    letter-spacing: 0.12em;
+    letter-spacing: 0.16em;
     white-space: nowrap;
     overflow: hidden;
   }
   .empty {
     padding: 0.5rem 0.75rem;
-    font-size: 0.75rem;
-    color: #303030;
-    letter-spacing: 0.02em;
+    font-size: 0.68rem;
+    color: var(--text-dim);
+    letter-spacing: 0.04em;
+    font-family: var(--font-ui);
   }
   .session-list {
     overflow-y: auto;
@@ -82,29 +83,36 @@
     width: 100%;
     background: none;
     border: none;
-    border-bottom: 1px solid rgba(255,255,255,0.04);
+    border-bottom: 1px solid rgba(255,255,255,0.03);
     padding: 0.6rem 0.75rem;
     cursor: pointer;
     text-align: left;
-    transition: background 0.1s;
+    transition: background 0.15s;
   }
-  .session-item:hover { background: rgba(255,255,255,0.03); }
-  .session-item.active { background: rgba(255,255,255,0.04); border-left: 1px solid #c8d8f0; }
+  .session-item:hover { background: rgba(10,40,80,0.2); }
+  .session-item.active {
+    background: rgba(10,40,80,0.3);
+    border-left: 1px solid rgba(200,216,240,0.5);
+  }
   .s-filename {
-    font-size: 0.75rem;
-    color: #909090;
+    font-size: 0.72rem;
+    color: #808090;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     margin-bottom: 0.2rem;
+    font-family: var(--font-ui);
+    letter-spacing: 0.02em;
   }
-  .session-item.active .s-filename { color: #f0f0f0; }
+  .session-item.active .s-filename { color: var(--text); }
   .s-meta {
     display: flex;
     align-items: center;
     gap: 0.5rem;
-    font-size: 0.68rem;
-    color: #404040;
+    font-size: 0.62rem;
+    color: var(--text-dim);
+    font-family: var(--font-ui);
+    letter-spacing: 0.03em;
   }
   .sev-dot { font-size: 0.55rem; }
 </style>

@@ -105,14 +105,27 @@ export async function uploadFile(file) {
 
 export async function loadSession(session_id) {
   loading.set(true);
+  uploadError.set(null);
   activeSessionId.set(session_id);
-  const result = await fetch(`/api/results/${session_id}`).then(r => r.json());
-  activeResult.set(result);
-  loading.set(false);
-  return result;
+  // Reset transient UI state from any previous session so old inspector
+  // contents / filters do not leak across.
+  closeInspector();
+  try {
+    const res = await fetch(`/api/results/${session_id}`);
+    if (!res.ok) throw new Error(`Failed to load session (${res.status})`);
+    const result = await res.json();
+    if (result.error) throw new Error(result.error);
+    activeResult.set(result);
+    return result;
+  } catch (e) {
+    uploadError.set(e.message || 'Failed to load session.');
+    return null;
+  } finally {
+    loading.set(false);
+  }
 }
 
-export async function openInspector(packetIndices, sessionId) {
+export function openInspector(packetIndices) {
   inspectorPackets.set(packetIndices);
   inspectorOpen.set(true);
 }

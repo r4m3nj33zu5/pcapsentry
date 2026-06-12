@@ -1,5 +1,6 @@
 <script>
   import { marked } from 'marked';
+  import DOMPurify from 'dompurify';
   import { activeSessionId } from '../../stores/session.js';
   export let result;
 
@@ -10,7 +11,7 @@
   let saving = false;
   let saveStatus = '';
 
-  $: rendered = preview ? marked.parse(notes) : '';
+  $: rendered = preview ? DOMPurify.sanitize(marked.parse(notes)) : '';
 
   async function save() {
     if (!sessionId) return;

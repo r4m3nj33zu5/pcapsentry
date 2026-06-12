@@ -1,6 +1,5 @@
 <script>
   import { activeResult, activeSessionId, loading, uploadProgress, uploadError, inspectorOpen } from './stores/session.js';
-  import { uploadError as uploadErrorStore } from './stores/session.js';
   import { clearInvestigation } from './stores/investigation.js';
 
   import UploadZone from './components/UploadZone.svelte';
@@ -10,9 +9,11 @@
   import InvestigationBar from './components/InvestigationBar.svelte';
   import SettingsPanel from './components/SettingsPanel.svelte';
   import TrafficTimeline from './components/TrafficTimeline.svelte';
+  import IpPopover from './components/IpPopover.svelte';
 
   import ExecutiveDashboard from './components/modules/ExecutiveDashboard.svelte';
   import AlertEngine from './components/modules/AlertEngine.svelte';
+  import ConversationsModule from './components/modules/ConversationsModule.svelte';
   import FlowAnalysis from './components/modules/FlowAnalysis.svelte';
   import DnsModule from './components/modules/DnsModule.svelte';
   import HttpModule from './components/modules/HttpModule.svelte';
@@ -63,7 +64,7 @@
         <div class="loading-inner">
           <div class="logo">PcapSentry</div>
           <div class="error-box">{$uploadError}</div>
-          <button class="retry-btn" on:click={() => uploadErrorStore.set(null)}>Try another file</button>
+          <button class="retry-btn" on:click={() => uploadError.set(null)}>Try another file</button>
         </div>
       </div>
 
@@ -111,33 +112,36 @@
           <AlertEngine {result} />
 
         {:else if activeTab === 2}
-          <FlowAnalysis {result} />
+          <ConversationsModule {result} gotoPackets={() => activeTab = 11} />
 
         {:else if activeTab === 3}
-          <DnsModule {result} />
+          <FlowAnalysis {result} />
 
         {:else if activeTab === 4}
-          <HttpModule {result} />
+          <DnsModule {result} />
 
         {:else if activeTab === 5}
-          <TlsModule {result} />
+          <HttpModule {result} />
 
         {:else if activeTab === 6}
-          <IocModule {result} />
+          <TlsModule {result} />
 
         {:else if activeTab === 7}
-          <GeoModule {result} />
+          <IocModule {result} />
 
         {:else if activeTab === 8}
-          <StatsModule {result} />
+          <GeoModule {result} />
 
         {:else if activeTab === 9}
-          <TimelineModule {result} />
+          <StatsModule {result} />
 
         {:else if activeTab === 10}
-          <PacketModule {result} />
+          <TimelineModule {result} />
 
         {:else if activeTab === 11}
+          <PacketModule {result} />
+
+        {:else if activeTab === 12}
           <NotesModule {result} />
         {/if}
       </div>
@@ -159,20 +163,22 @@
   {/if}
 
   <SettingsPanel open={settingsOpen} onclose={() => settingsOpen = false} />
+  <IpPopover {result} />
 </div>
 
 <style>
   :global(body) {
     background: #000000;
     color: #f0f0f0;
-    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    font-family: var(--font-body);
     margin: 0;
   }
 
-  /* Syne for all uppercase labels and card headers across modules */
+  /* Oxanium for all UI labels, nav headers, card titles across modules */
   :global(.card-title), :global(.section-title), :global(.gauge-label),
   :global(.module-title), :global(.panel-title) {
-    font-family: 'Syne', 'Inter', sans-serif !important;
+    font-family: var(--font-ui) !important;
+    letter-spacing: 0.08em !important;
   }
 
   .app-shell {
@@ -181,6 +187,9 @@
     overflow: hidden;
     position: relative;
     background: #000000;
+    /* Subtle deep navy atmospheric gradient */
+    background-image:
+      radial-gradient(ellipse 80% 60% at 50% -20%, rgba(10,40,80,0.35) 0%, transparent 70%);
   }
 
   /* Sidebar */
@@ -188,7 +197,7 @@
     width: 220px;
     flex-shrink: 0;
     position: relative;
-    border-right: 1px solid rgba(255,255,255,0.06);
+    border-right: 1px solid var(--border);
     transition: width 0.2s ease;
     display: flex;
     flex-direction: column;
@@ -203,10 +212,10 @@
     transform: translateY(-50%);
     width: 24px;
     height: 24px;
-    background: #0a0a0a;
-    border: 1px solid rgba(255,255,255,0.1);
+    background: #050508;
+    border: 1px solid var(--border);
     border-radius: 2px;
-    color: #606060;
+    color: var(--text-muted);
     cursor: pointer;
     font-size: 0.75rem;
     display: flex;
@@ -215,7 +224,7 @@
     z-index: 10;
     transition: color 0.15s, border-color 0.15s;
   }
-  .collapse-btn:hover { color: #f0f0f0; border-color: rgba(255,255,255,0.25); }
+  .collapse-btn:hover { color: var(--text); border-color: var(--border-hover); }
 
   /* Main content */
   .main-content {
@@ -232,54 +241,60 @@
     align-items: center;
     gap: 0.75rem;
     padding: 0.55rem 1rem;
-    border-bottom: 1px solid rgba(255,255,255,0.06);
+    border-bottom: 1px solid var(--border);
     flex-shrink: 0;
     background: #000000;
   }
   .app-logo {
-    font-family: 'Syne', sans-serif;
-    font-size: 0.9rem;
+    font-family: var(--font-ui);
+    font-size: 0.85rem;
     font-weight: 700;
-    color: #f0f0f0;
-    letter-spacing: 0.1em;
+    color: var(--text);
+    letter-spacing: 0.14em;
     text-transform: uppercase;
   }
   .filename {
-    color: #444444;
-    font-size: 0.78rem;
+    color: var(--text-muted);
+    font-size: 0.75rem;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     max-width: 300px;
     font-weight: 400;
+    font-family: var(--font-ui);
+    letter-spacing: 0.03em;
   }
   .topbar-right { margin-left: auto; display: flex; align-items: center; gap: 0.5rem; }
   .icon-btn {
     background: none;
     border: 1px solid rgba(255,255,255,0.08);
-    color: #505050;
+    color: var(--text-muted);
     width: 28px;
     height: 28px;
     border-radius: 2px;
     cursor: pointer;
     font-size: 0.85rem;
-    transition: color 0.15s, border-color 0.15s;
-  }
-  .icon-btn:hover { color: #f0f0f0; border-color: rgba(255,255,255,0.2); }
-  .new-btn {
-    background: transparent;
-    border: 1px solid rgba(255,255,255,0.12);
-    color: #909090;
-    padding: 4px 12px;
-    border-radius: 2px;
-    cursor: pointer;
-    font-size: 0.72rem;
-    font-family: 'Inter', sans-serif;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
     transition: color 0.15s, border-color 0.15s, background 0.15s;
   }
-  .new-btn:hover { background: rgba(255,255,255,0.04); color: #f0f0f0; border-color: rgba(255,255,255,0.25); }
+  .icon-btn:hover { color: var(--text); border-color: var(--border-hover); background: rgba(255,255,255,0.04); }
+  .new-btn {
+    background: transparent;
+    border: 1px solid rgba(255,255,255,0.14);
+    color: #888898;
+    padding: 4px 14px;
+    border-radius: 2px;
+    cursor: pointer;
+    font-size: 0.68rem;
+    font-family: var(--font-ui);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    transition: color 0.2s, border-color 0.2s, background 0.2s;
+  }
+  .new-btn:hover {
+    background: var(--text);
+    color: #000000;
+    border-color: var(--text);
+  }
 
   /* Tab content area */
   .tab-content {
@@ -309,28 +324,37 @@
     align-items: center;
     justify-content: center;
     height: 100%;
-    gap: 2rem;
+    gap: 2.5rem;
     background: #000000;
+    background-image:
+      radial-gradient(ellipse 60% 50% at 50% 40%, rgba(10,40,80,0.45) 0%, transparent 65%),
+      linear-gradient(180deg, rgba(10,40,80,0.12) 0%, transparent 50%);
   }
   .upload-logo { text-align: center; }
   .logo-mark {
-    font-family: 'Syne', sans-serif;
-    font-size: 1.1rem;
-    color: #f0f0f0;
-    margin-bottom: 1rem;
-    letter-spacing: 0.25em;
+    font-family: var(--font-ui);
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    margin-bottom: 1.25rem;
+    letter-spacing: 0.35em;
     text-transform: uppercase;
-    font-weight: 800;
+    font-weight: 500;
   }
   h1 {
-    font-family: 'Syne', sans-serif;
-    font-size: 1.6rem;
+    font-family: var(--font-display);
+    font-size: 2rem;
     font-weight: 700;
-    color: #f0f0f0;
-    letter-spacing: 0.06em;
+    color: var(--text);
+    letter-spacing: 0.08em;
     text-transform: uppercase;
   }
-  .upload-logo p { color: #444444; margin-top: 0.75rem; font-size: 0.8rem; letter-spacing: 0.04em; }
+  .upload-logo p {
+    color: var(--text-muted);
+    margin-top: 0.75rem;
+    font-size: 0.78rem;
+    letter-spacing: 0.05em;
+    font-family: var(--font-ui);
+  }
 
   /* Loading screen */
   .loading-screen {
@@ -339,53 +363,63 @@
     justify-content: center;
     flex: 1;
     background: #000000;
+    background-image: radial-gradient(ellipse 60% 50% at 50% 40%, rgba(10,40,80,0.3) 0%, transparent 65%);
   }
   .loading-inner { text-align: center; width: 400px; }
   .logo {
-    font-family: 'Syne', sans-serif;
-    font-size: 0.9rem;
+    font-family: var(--font-ui);
+    font-size: 0.85rem;
     font-weight: 700;
-    color: #f0f0f0;
-    letter-spacing: 0.12em;
+    color: var(--text);
+    letter-spacing: 0.16em;
     text-transform: uppercase;
     margin-bottom: 0.5rem;
   }
   .progress-bar-wrap {
     margin: 1.5rem 0 0.75rem;
     height: 1px;
-    background: rgba(255,255,255,0.08);
+    background: rgba(255,255,255,0.07);
     border-radius: 0;
     overflow: hidden;
   }
   .progress-bar-fill {
     height: 100%;
-    background: #c8d8f0;
+    background: var(--accent);
     border-radius: 0;
     transition: width 0.4s ease;
   }
   .error-box {
     margin: 1.5rem 0 1rem;
     padding: 0.75rem 1rem;
-    background: rgba(224,62,90,0.06);
-    border: 1px solid rgba(224,62,90,0.25);
+    background: rgba(224,62,90,0.05);
+    border: 1px solid rgba(224,62,90,0.2);
     border-radius: 2px;
-    color: #e03e5a;
-    font-size: 0.85rem;
+    color: var(--critical);
+    font-size: 0.82rem;
     text-align: left;
     word-break: break-word;
+    font-family: var(--font-ui);
+    letter-spacing: 0.02em;
   }
   .retry-btn {
     background: transparent;
-    border: 1px solid rgba(255,255,255,0.12);
-    color: #909090;
-    padding: 0.5rem 1.25rem;
+    border: 1px solid rgba(255,255,255,0.14);
+    color: #888898;
+    padding: 0.5rem 1.5rem;
     border-radius: 2px;
     cursor: pointer;
-    font-size: 0.75rem;
-    letter-spacing: 0.08em;
+    font-size: 0.7rem;
+    font-family: var(--font-ui);
+    letter-spacing: 0.1em;
     text-transform: uppercase;
-    transition: color 0.15s, border-color 0.15s;
+    transition: color 0.2s, border-color 0.2s, background 0.2s;
   }
-  .retry-btn:hover { color: #f0f0f0; border-color: rgba(255,255,255,0.25); }
-  .progress-label { color: #444444; font-size: 0.78rem; margin-top: 0.5rem; letter-spacing: 0.04em; }
+  .retry-btn:hover { background: var(--text); color: #000; border-color: var(--text); }
+  .progress-label {
+    color: var(--text-muted);
+    font-size: 0.72rem;
+    margin-top: 0.5rem;
+    letter-spacing: 0.06em;
+    font-family: var(--font-ui);
+  }
 </style>

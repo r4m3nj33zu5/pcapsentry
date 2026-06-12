@@ -4,7 +4,7 @@
   export let flows = [];
 
   const SUSPICIOUS_PORTS = new Set([4444, 31337, 23, 12345, 6666, 6667, 1337]);
-  const NOTABLE_PORTS = new Set([8080, 25, 21, 587, 143, 110, 3306, 5432, 3389, 22, 3389]);
+  const NOTABLE_PORTS = new Set([8080, 25, 21, 587, 143, 110, 3306, 5432, 3389, 22]);
 
   let sortKey = 'bytes';
   let sortAsc = false;
@@ -14,8 +14,10 @@
   $: filtered = flows.filter(f => {
     if (!filter) return true;
     const q = filter.toLowerCase();
-    return f.src_ip.includes(q) || f.dst_ip.includes(q) ||
-           f.protocol.toLowerCase().includes(q) ||
+    // Null-guard each field — L2-only flows may lack src/dst IP or protocol.
+    return (f.src_ip || '').includes(q) ||
+           (f.dst_ip || '').includes(q) ||
+           (f.protocol || '').toLowerCase().includes(q) ||
            String(f.dst_port || '').includes(q);
   });
 

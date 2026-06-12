@@ -35,6 +35,7 @@
     const nodes = Array.from(ipMap.values()).slice(0, 120);
     const nodeIds = new Set(nodes.map(n => n.id));
 
+    const SUSPICIOUS = new Set([4444, 31337, 23, 12345, 6666, 6667, 1337]);
     const links = flows
       .filter(f => nodeIds.has(f.src_ip) && nodeIds.has(f.dst_ip) && f.src_ip !== f.dst_ip)
       .slice(0, 400)
@@ -43,6 +44,9 @@
         target: f.dst_ip,
         value: f.bytes,
         protocol: f.protocol,
+        // Capture at build time — after force-graph processes the link the
+        // `target` field is replaced with the node object and dst_port is gone.
+        isSuspicious: SUSPICIOUS.has(f.dst_port),
       }));
 
     return { nodes, links };
@@ -71,10 +75,13 @@
         .backgroundColor('rgba(0,0,0,0)')
         .graphData(graphData)
         .nodeId('id')
+        // HTML-escape n.id and n.vendor — n.id is an IP from arbitrary pcap
+        // data and n.vendor comes from an OUI lookup that could be widened
+        // later to less-trusted sources.
         .nodeLabel(n => `
           <div style="background:#111111;border:1px solid #c8d8f044;border-radius:6px;padding:6px 10px;font-family:monospace;font-size:12px;color:#f0f0f0;pointer-events:none">
-            <div style="color:${n.isThreat ? '#e03e5a' : '#c8d8f0'};font-weight:bold">${n.id}</div>
-            ${n.vendor ? `<div style="color:#606060">${n.vendor}</div>` : ''}
+            <div style="color:${n.isThreat ? '#e03e5a' : '#c8d8f0'};font-weight:bold">${esc(n.id)}</div>
+            ${n.vendor ? `<div style="color:#606060">${esc(n.vendor)}</div>` : ''}
             <div>${fmtBytes(n.bytes)}</div>
           </div>`)
         .nodeColor(n => n.isThreat ? '#e03e5a' : '#c8d8f0')
@@ -86,10 +93,7 @@
         .linkOpacity(0.4)
         .linkDirectionalParticles(2)
         .linkDirectionalParticleSpeed(0.004)
-        .linkDirectionalParticleColor(l => {
-          const SUSPICIOUS = new Set([4444, 31337, 23, 12345, 6666, 1337]);
-          return SUSPICIOUS.has(l.target?.dst_port) ? '#e03e5a' : '#c8d8f0';
-        })
+        .linkDirectionalParticleColor(l => l.isSuspicious ? '#e03e5a' : '#c8d8f0')
         .onNodeClick(n => viewHostPackets(n.id))
         .onNodeHover(n => {
           if (el) el.style.cursor = n ? 'pointer' : 'default';
@@ -138,6 +142,12 @@
     if (b >= 1048576)    return (b / 1048576).toFixed(1) + ' MB';
     if (b >= 1024)       return (b / 1024).toFixed(1) + ' KB';
     return b + ' B';
+  }
+
+  function esc(s) {
+    return String(s ?? '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 </script>
 

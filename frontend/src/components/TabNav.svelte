@@ -6,16 +6,17 @@
   const tabs = [
     { id: 0, label: 'Triage', icon: '◈' },
     { id: 1, label: 'Alerts', icon: '⚡', badge: true },
-    { id: 2, label: 'Flows', icon: '⇌' },
-    { id: 3, label: 'DNS', icon: '◎' },
-    { id: 4, label: 'HTTP', icon: '⊕' },
-    { id: 5, label: 'TLS', icon: '🔒' },
-    { id: 6, label: 'IOC', icon: '◉' },
-    { id: 7, label: 'Geo', icon: '⊞' },
-    { id: 8, label: 'Stats', icon: '≡' },
-    { id: 9, label: 'Timeline', icon: '◷' },
-    { id: 10, label: 'Packets', icon: '⊟' },
-    { id: 11, label: 'Notes', icon: '✎' },
+    { id: 2, label: 'Conversations', icon: '⧉' },
+    { id: 3, label: 'Flows', icon: '⇌' },
+    { id: 4, label: 'DNS', icon: '◎' },
+    { id: 5, label: 'HTTP', icon: '⊕' },
+    { id: 6, label: 'TLS', icon: '🔒' },
+    { id: 7, label: 'IOC', icon: '◉' },
+    { id: 8, label: 'Geo', icon: '⊞' },
+    { id: 9, label: 'Stats', icon: '≡' },
+    { id: 10, label: 'Timeline', icon: '◷' },
+    { id: 11, label: 'Packets', icon: '⊟' },
+    { id: 12, label: 'Notes', icon: '✎' },
   ];
 </script>
 
@@ -39,7 +40,7 @@
   .tab-nav {
     display: flex;
     gap: 0;
-    border-bottom: 1px solid rgba(255,255,255,0.06);
+    border-bottom: 1px solid var(--border);
     background: #000000;
     overflow-x: auto;
     scrollbar-width: none;
@@ -51,38 +52,39 @@
     display: flex;
     align-items: center;
     gap: 5px;
-    padding: 9px 14px;
+    padding: 9px 15px;
     background: none;
     border: none;
     border-bottom: 1px solid transparent;
-    color: #404040;
-    font-size: 0.7rem;
-    font-family: 'Syne', 'Inter', sans-serif;
+    color: var(--text-dim);
+    font-size: 0.66rem;
+    font-family: var(--font-ui);
     font-weight: 600;
-    letter-spacing: 0.09em;
+    letter-spacing: 0.11em;
     text-transform: uppercase;
     cursor: pointer;
     white-space: nowrap;
-    transition: color 0.15s, border-color 0.15s;
+    transition: color 0.15s, border-color 0.15s, background 0.15s;
     position: relative;
   }
-  .tab-btn:hover { color: #a0a0a0; }
+  .tab-btn:hover { color: #808090; background: rgba(255,255,255,0.02); }
   .tab-btn.active {
-    color: #f0f0f0;
-    border-bottom-color: rgba(255,255,255,0.7);
+    color: var(--text);
+    border-bottom-color: rgba(200, 216, 240, 0.6);
+    background: rgba(10, 40, 80, 0.15);
   }
-  .tab-icon { font-style: normal; opacity: 0.5; font-size: 0.85em; }
-  .tab-btn.active .tab-icon { opacity: 0.9; }
+  .tab-icon { font-style: normal; opacity: 0.4; font-size: 0.85em; }
+  .tab-btn.active .tab-icon { opacity: 0.8; }
   .badge {
-    background: #e03e5a;
+    background: var(--critical);
     color: #fff;
-    font-size: 0.6rem;
+    font-size: 0.58rem;
     font-weight: 700;
     padding: 1px 5px;
     border-radius: 2px;
     min-width: 16px;
     text-align: center;
-    font-family: 'Inter', sans-serif;
-    letter-spacing: 0;
+    font-family: var(--font-ui);
+    letter-spacing: 0.02em;
   }
 </style>

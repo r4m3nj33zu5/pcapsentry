@@ -130,51 +130,53 @@
   .stat-card {
     flex: 1;
     min-width: 110px;
-    background: #111111;
-    border: 1px solid rgba(200, 216, 240, 0.18);
-    
+    background: rgba(10,40,80,0.1);
+    border: 1px solid var(--border);
     border-radius: 2px;
     padding: 0.9rem 1.1rem;
-    transition: box-shadow 0.3s;
+    transition: border-color 0.2s, background 0.2s;
   }
   .stat-card:hover {
-    
+    background: rgba(10,40,80,0.2);
+    border-color: rgba(200,216,240,0.14);
   }
   .stat-card.critical {
-    border-color: rgba(255,32,121,0.4);
-    
+    border-color: rgba(224,62,90,0.3);
+    background: rgba(224,62,90,0.04);
   }
   .label {
-    font-size: 0.7rem;
-    color: #606060;
+    font-size: 0.6rem;
+    color: var(--text-muted);
     text-transform: uppercase;
-    letter-spacing: 0.06em;
+    letter-spacing: 0.1em;
     margin-bottom: 0.4rem;
+    font-family: var(--font-ui);
   }
   .value {
-    font-size: 1.4rem;
+    font-size: 1.35rem;
     font-weight: 700;
-    color: #4ade80;
-    
+    color: var(--accent);
+    font-family: var(--font-ui);
     display: flex;
     align-items: center;
     gap: 0.5rem;
     flex-wrap: wrap;
   }
   .sev-badge {
-    font-size: 0.65rem;
-    font-weight: 700;
-    padding: 0.15rem 0.5rem;
-    border-radius: 999px;
+    font-size: 0.58rem;
+    font-weight: 600;
+    padding: 0.15rem 0.55rem;
+    border-radius: 2px;
     border: 1px solid;
-    letter-spacing: 0.05em;
-    text-shadow: none;
+    letter-spacing: 0.07em;
+    font-family: var(--font-ui);
+    text-transform: uppercase;
   }
   .pulse-critical {
-    animation: pulse-critical 1.5s ease-in-out infinite;
+    animation: pulse-critical 1.8s ease-in-out infinite;
   }
   @keyframes pulse-critical {
-    0%, 100% {  }
-    50%       {  }
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0.6; }
   }
 </style>

@@ -67,55 +67,63 @@
     width: min(480px, 90vw);
     border: 1px solid rgba(255,255,255,0.08);
     border-radius: 2px;
-    padding: 3rem 2rem;
+    padding: 3.5rem 2.5rem;
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 0.75rem;
+    gap: 0.85rem;
     cursor: pointer;
-    transition: border-color 0.2s, background 0.2s;
-    color: #404040;
-    background: #0a0a0a;
+    transition: border-color 0.25s, background 0.25s;
+    color: var(--text-muted);
+    background: rgba(10, 40, 80, 0.08);
   }
   .zone.dragging {
-    border-color: rgba(255,255,255,0.2);
-    background: rgba(255,255,255,0.02);
-    color: #c8d8f0;
+    border-color: rgba(200,216,240,0.35);
+    background: rgba(10, 40, 80, 0.25);
+    color: var(--accent);
   }
   .hint {
-    font-size: 0.85rem;
-    color: #505050;
-    letter-spacing: 0.02em;
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    letter-spacing: 0.04em;
+    font-family: var(--font-ui);
   }
   .or {
-    font-size: 0.75rem;
-    color: #303030;
+    font-size: 0.65rem;
+    color: var(--text-dim);
+    font-family: var(--font-ui);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
   }
   .btn {
-    padding: 0.5rem 1.5rem;
+    padding: 0.55rem 1.75rem;
     background: transparent;
-    border: 1px solid rgba(255,255,255,0.12);
+    border: 1px solid rgba(255,255,255,0.16);
     border-radius: 2px;
-    color: #c0c0c0;
-    font-size: 0.78rem;
-    font-family: 'Inter', sans-serif;
-    letter-spacing: 0.06em;
+    color: #a0a0b0;
+    font-size: 0.68rem;
+    font-family: var(--font-ui);
+    letter-spacing: 0.1em;
     text-transform: uppercase;
     cursor: pointer;
-    transition: color 0.15s, border-color 0.15s, background 0.15s;
+    transition: color 0.2s, border-color 0.2s, background 0.2s;
   }
   .btn:hover {
-    color: #f0f0f0;
-    border-color: rgba(255,255,255,0.25);
-    background: rgba(255,255,255,0.04);
+    color: #000000;
+    border-color: var(--text);
+    background: var(--text);
   }
   .error {
-    color: #e03e5a;
-    font-size: 0.82rem;
+    color: var(--critical);
+    font-size: 0.78rem;
+    font-family: var(--font-ui);
+    letter-spacing: 0.03em;
   }
   .size-warn {
-    color: #c8920a;
-    font-size: 0.78rem;
+    color: var(--medium);
+    font-size: 0.72rem;
     text-align: center;
+    font-family: var(--font-ui);
+    letter-spacing: 0.03em;
   }
 </style>

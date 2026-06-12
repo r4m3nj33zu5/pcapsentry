@@ -1,6 +1,9 @@
 <script>
   import { activeSessionId } from '../../stores/session.js';
-  import { investigationFilter, focusOnIp, focusOnFlow } from '../../stores/investigation.js';
+  import { investigationFilter, focusOnIp, focusOnFlow, openIpPivot } from '../../stores/investigation.js';
+  import StreamViewer from '../StreamViewer.svelte';
+
+  let streamFlow = null; // flow to show in stream viewer
 
   export let result;
 
@@ -90,9 +93,9 @@
             class:suspicious={flow.is_suspicious}
             on:click={() => toggleFlow(flow)}
           >
-            <td class="ip" on:click|stopPropagation={() => focusOnIp(flow.src_ip)}>{flow.src_ip}</td>
+            <td class="ip" on:click|stopPropagation={(e) => openIpPivot(flow.src_ip, e)}>{flow.src_ip}</td>
             <td class="port">{flow.src_port ?? '—'}</td>
-            <td class="ip" on:click|stopPropagation={() => focusOnIp(flow.dst_ip)}>{flow.dst_ip}</td>
+            <td class="ip" on:click|stopPropagation={(e) => openIpPivot(flow.dst_ip, e)}>{flow.dst_ip}</td>
             <td class="port">{flow.dst_port ?? '—'}</td>
             <td class="proto">{flow.protocol}</td>
             <td class="svc">{flow.service_guess}</td>
@@ -117,9 +120,16 @@
                       <code class="payload-hex">{flow.payload_preview}</code>
                     </div>
                   {/if}
-                  <button class="focus-btn" on:click={() => focusOnFlow(flow.flow_id)}>
-                    ⇌ Focus Investigation on Flow
-                  </button>
+                  <div class="detail-actions">
+                    <button class="focus-btn" on:click={() => focusOnFlow(flow.flow_id)}>
+                      ⇌ Focus on Flow
+                    </button>
+                    {#if flow.protocol === 'TCP'}
+                      <button class="stream-btn" on:click|stopPropagation={() => streamFlow = flow}>
+                        ⊞ View Stream
+                      </button>
+                    {/if}
+                  </div>
                 </div>
               </td>
             </tr>
@@ -128,6 +138,10 @@
       </tbody>
     </table>
   </div>
+
+  {#if streamFlow}
+    <StreamViewer flow={streamFlow} onclose={() => streamFlow = null} />
+  {/if}
 
   {#if totalPages > 1}
     <div class="pagination">
@@ -170,8 +184,11 @@
   .mono { font-family:monospace; }
   .payload { margin-bottom:0.75rem; }
   .payload-hex { display:block; font-family:monospace; font-size:0.72rem; color:#4ade80; word-break:break-all; margin-top:4px; }
-  .focus-btn { background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.09); color:#c8d8f0; padding:4px 10px; border-radius:4px; font-size:0.75rem; cursor:pointer; }
-  .focus-btn:hover { background:rgba(255,255,255,0.08); }
+  .detail-actions { display:flex; gap:0.5rem; flex-wrap:wrap; }
+  .focus-btn { background:rgba(10,40,80,0.15); border:1px solid rgba(200,216,240,0.12); color:var(--accent); padding:4px 12px; border-radius:2px; font-size:0.65rem; font-family:var(--font-ui); letter-spacing:0.07em; text-transform:uppercase; cursor:pointer; transition:background 0.2s,color 0.2s,border-color 0.2s; }
+  .focus-btn:hover { background:var(--text); color:#000; border-color:var(--text); }
+  .stream-btn { background:rgba(74,222,128,0.05); border:1px solid rgba(74,222,128,0.18); color:var(--low); padding:4px 12px; border-radius:2px; font-size:0.65rem; font-family:var(--font-ui); letter-spacing:0.07em; text-transform:uppercase; cursor:pointer; transition:background 0.2s,color 0.2s,border-color 0.2s; }
+  .stream-btn:hover { background:var(--low); color:#000; border-color:var(--low); }
   .pagination { display:flex; align-items:center; gap:0.5rem; justify-content:center; padding:0.5rem; border-top:1px solid rgba(255,255,255,0.05); }
   .pagination button { background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); color:#c8d8f0; padding:3px 8px; border-radius:4px; cursor:pointer; font-size:0.8rem; }
   .pagination button:disabled { opacity:0.3; cursor:not-allowed; }

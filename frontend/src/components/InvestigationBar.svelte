@@ -3,13 +3,14 @@
 
   $: filter = $investigationFilter;
   $: hasFilters = filter.focusIp || filter.focusFlow || filter.focusTimeRange ||
-                  filter.focusMitreTechnique || filter.focusAlertId;
+                  filter.focusMitreTechnique || filter.focusAlertId || filter.focusPacketSet;
 
   function removeIp() { investigationFilter.update(f => ({ ...f, focusIp: null })); }
   function removeFlow() { investigationFilter.update(f => ({ ...f, focusFlow: null })); }
   function removeTime() { investigationFilter.update(f => ({ ...f, focusTimeRange: null })); }
   function removeMitre() { investigationFilter.update(f => ({ ...f, focusMitreTechnique: null })); }
   function removeAlert() { investigationFilter.update(f => ({ ...f, focusAlertId: null })); }
+  function removePacketSet() { investigationFilter.update(f => ({ ...f, focusPacketSet: null, focusPacketLabel: null })); }
 
   function fmtTime(ts) {
     if (!ts) return '';
@@ -56,6 +57,13 @@
     </span>
   {/if}
 
+  {#if filter.focusPacketSet}
+    <span class="pill pill-flow">
+      Conversation: {filter.focusPacketLabel || `${filter.focusPacketSet.size} packets`}
+      <button class="pill-x" on:click={removePacketSet}>×</button>
+    </span>
+  {/if}
+
   <button class="clear-all" on:click={clearInvestigation}>Clear All</button>
 </div>
 {/if}
@@ -66,26 +74,35 @@
     align-items: center;
     flex-wrap: wrap;
     gap: 6px;
-    padding: 6px 16px;
-    background: rgba(255,255,255,0.03);
-    border-bottom: 1px solid rgba(255,255,255,0.07);
-    font-size: 0.78rem;
+    padding: 5px 16px;
+    background: rgba(10,40,80,0.2);
+    border-bottom: 1px solid rgba(200,216,240,0.08);
+    font-size: 0.75rem;
   }
-  .inv-label { color: #606060; font-weight: 600; }
+  .inv-label {
+    color: var(--text-muted);
+    font-weight: 600;
+    font-family: var(--font-ui);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    font-size: 0.62rem;
+  }
   .pill {
     display: inline-flex;
     align-items: center;
     gap: 5px;
     padding: 2px 8px;
-    border-radius: 12px;
-    font-size: 0.75rem;
+    border-radius: 2px;
+    font-size: 0.68rem;
     font-weight: 500;
+    font-family: var(--font-ui);
+    letter-spacing: 0.04em;
   }
-  .pill-ip { background: rgba(255,255,255,0.08); color: #c8d8f0; border: 1px solid rgba(255,255,255,0.15); }
-  .pill-flow { background: rgba(57,255,20,0.1); color: #4ade80; border: 1px solid rgba(57,255,20,0.3); }
-  .pill-time { background: rgba(255,165,0,0.1); color: #c8920a; border: 1px solid rgba(255,165,0,0.3); }
-  .pill-mitre { background: rgba(138,43,226,0.15); color: #bf5fff; border: 1px solid rgba(138,43,226,0.4); }
-  .pill-alert { background: rgba(255,32,121,0.1); color: #e03e5a; border: 1px solid rgba(255,32,121,0.3); }
+  .pill-ip { background: rgba(200,216,240,0.07); color: var(--accent); border: 1px solid rgba(200,216,240,0.18); }
+  .pill-flow { background: rgba(74,222,128,0.07); color: var(--low); border: 1px solid rgba(74,222,128,0.25); }
+  .pill-time { background: rgba(200,146,10,0.07); color: var(--medium); border: 1px solid rgba(200,146,10,0.25); }
+  .pill-mitre { background: rgba(191,95,255,0.08); color: #bf5fff; border: 1px solid rgba(191,95,255,0.3); }
+  .pill-alert { background: rgba(224,62,90,0.07); color: var(--critical); border: 1px solid rgba(224,62,90,0.25); }
   .pill-x {
     background: none;
     border: none;
@@ -94,18 +111,22 @@
     font-size: 1rem;
     line-height: 1;
     padding: 0;
-    opacity: 0.7;
+    opacity: 0.6;
   }
   .pill-x:hover { opacity: 1; }
   .clear-all {
     background: none;
-    border: 1px solid rgba(255,32,121,0.3);
-    color: #e03e5a;
-    padding: 2px 8px;
-    border-radius: 4px;
-    font-size: 0.72rem;
+    border: 1px solid rgba(224,62,90,0.25);
+    color: var(--critical);
+    padding: 2px 10px;
+    border-radius: 2px;
+    font-size: 0.62rem;
+    font-family: var(--font-ui);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
     cursor: pointer;
     margin-left: auto;
+    transition: background 0.15s, color 0.15s;
   }
-  .clear-all:hover { background: rgba(255,32,121,0.1); }
+  .clear-all:hover { background: rgba(224,62,90,0.1); }
 </style>

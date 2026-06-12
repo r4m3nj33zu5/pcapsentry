@@ -92,14 +92,15 @@
 <style>
   .overlay {
     position: fixed; inset: 0;
-    background: rgba(0,0,0,0.5);
+    background: rgba(0,0,0,0.6);
     z-index: 999;
   }
   .panel {
     position: fixed; top: 0; right: 0; bottom: 0;
     width: 360px;
-    background: #0a0a0a;
-    border-left: 1px solid rgba(255,255,255,0.09);
+    background: #030306;
+    background-image: linear-gradient(180deg, rgba(10,40,80,0.25) 0%, transparent 40%);
+    border-left: 1px solid var(--border);
     z-index: 1000;
     display: flex;
     flex-direction: column;
@@ -110,46 +111,96 @@
     align-items: center;
     justify-content: space-between;
     padding: 1rem 1.25rem;
-    border-bottom: 1px solid rgba(255,255,255,0.07);
+    border-bottom: 1px solid var(--border);
   }
   .panel-title {
-    color: #c8d8f0;
+    color: var(--text);
     font-weight: 700;
-    font-size: 0.95rem;
-    letter-spacing: 0.05em;
+    font-size: 0.78rem;
+    letter-spacing: 0.14em;
+    font-family: var(--font-ui);
+    text-transform: uppercase;
   }
   .close-btn {
-    background: none; border: none; color: #606060;
-    cursor: pointer; font-size: 1.1rem;
+    background: none; border: none; color: var(--text-muted);
+    cursor: pointer; font-size: 1rem;
+    transition: color 0.15s;
   }
-  .close-btn:hover { color: #f0f0f0; }
+  .close-btn:hover { color: var(--text); }
   .panel-body { padding: 1.25rem; overflow-y: auto; flex: 1; }
   section { margin-bottom: 2rem; }
-  h3 { color: #909090; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.1em; margin: 0 0 0.75rem; }
-  .hint { color: #606060; font-size: 0.78rem; margin-bottom: 1rem; line-height: 1.5; }
-  code { color: #c8d8f0; font-size: 0.75rem; }
-  .status-row { display: flex; justify-content: space-between; font-size: 0.8rem; margin-bottom: 0.35rem; color: #787878; }
-  .configured { color: #4ade80; }
-  .not-configured { color: #e03e5a; }
+  h3 {
+    color: var(--text-muted);
+    font-size: 0.62rem;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    margin: 0 0 0.75rem;
+    font-family: var(--font-ui);
+  }
+  .hint {
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    margin-bottom: 1rem;
+    line-height: 1.55;
+    font-family: var(--font-body);
+  }
+  code {
+    color: var(--accent);
+    font-size: 0.72rem;
+    font-family: var(--font-ui);
+    letter-spacing: 0.03em;
+  }
+  .status-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.72rem;
+    margin-bottom: 0.35rem;
+    color: var(--text-muted);
+    font-family: var(--font-ui);
+    letter-spacing: 0.04em;
+  }
+  .configured { color: var(--low); }
+  .not-configured { color: var(--critical); }
   .field { margin-bottom: 0.75rem; }
-  label { display: block; font-size: 0.75rem; color: #606060; margin-bottom: 4px; }
+  label {
+    display: block;
+    font-size: 0.62rem;
+    color: var(--text-muted);
+    margin-bottom: 4px;
+    font-family: var(--font-ui);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
   input {
     width: 100%; box-sizing: border-box;
-    background: rgba(255,255,255,0.04);
-    border: 1px solid rgba(255,255,255,0.09);
-    color: #f0f0f0; padding: 7px 10px;
-    border-radius: 2px; font-size: 0.82rem;
-    font-family: monospace;
+    background: rgba(10,40,80,0.15);
+    border: 1px solid var(--border);
+    color: var(--text); padding: 7px 10px;
+    border-radius: 2px; font-size: 0.78rem;
+    font-family: var(--font-ui);
+    letter-spacing: 0.03em;
+    transition: border-color 0.15s;
   }
-  input:focus { outline: none; border-color: rgba(255,255,255,0.2); }
+  input::placeholder { color: var(--text-muted); }
+  input:focus { outline: none; border-color: rgba(200,216,240,0.2); }
   .save-btn {
-    background: rgba(255,255,255,0.07);
-    border: 1px solid rgba(255,255,255,0.15);
-    color: #c8d8f0; padding: 7px 16px;
-    border-radius: 2px; font-size: 0.82rem;
+    background: transparent;
+    border: 1px solid rgba(255,255,255,0.16);
+    color: #a0a0b0; padding: 7px 18px;
+    border-radius: 2px; font-size: 0.68rem;
+    font-family: var(--font-ui);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
     cursor: pointer; margin-top: 0.5rem;
+    transition: background 0.2s, color 0.2s, border-color 0.2s;
   }
-  .save-btn:hover:not(:disabled) { background: rgba(255,255,255,0.1); }
-  .save-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-  .saved-msg { color: #4ade80; font-size: 0.8rem; margin-left: 0.75rem; }
+  .save-btn:hover:not(:disabled) { background: var(--text); color: #000; border-color: var(--text); }
+  .save-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .saved-msg {
+    color: var(--low);
+    font-size: 0.68rem;
+    margin-left: 0.75rem;
+    font-family: var(--font-ui);
+    letter-spacing: 0.06em;
+  }
 </style>

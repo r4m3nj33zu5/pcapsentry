@@ -76,13 +76,18 @@
         .pointColor(d => threatIps.has(d.ip) ? '#e03e5a' : '#c8d8f0')
         .pointRadius(d => Math.max(0.18, 0.07 * Math.log(d.packet_count + 2)))
         .pointAltitude(0.01)
-        .pointLabel(d => `
+        // HTML-escape pcap-derived strings before injecting into the tooltip.
+        .pointLabel(d => {
+          const loc = [d.city, d.country].filter(Boolean).join(', ');
+          const isThreat = threatIps.has(d.ip);
+          return `
           <div style="background:#111111;border:1px solid #c8d8f044;border-radius:6px;padding:6px 10px;font-family:monospace;font-size:12px;color:#f0f0f0;pointer-events:none">
-            <div style="color:#c8d8f0;font-weight:bold">${d.ip}</div>
-            ${d.city || d.country ? `<div style="color:#606060">${[d.city, d.country].filter(Boolean).join(', ')}</div>` : ''}
+            <div style="color:#c8d8f0;font-weight:bold">${esc(d.ip)}</div>
+            ${loc ? `<div style="color:#606060">${esc(loc)}</div>` : ''}
             <div>${d.packet_count.toLocaleString()} pkts · ${fmtBytes(d.bytes)}</div>
-            ${threatIps.has(d.ip) ? '<div style="color:#e03e5a">⚠ Threat IP</div>' : ''}
-          </div>`)
+            ${isThreat ? '<div style="color:#e03e5a">⚠ Threat IP</div>' : ''}
+          </div>`;
+        })
         .onPointClick(d => viewHostPackets(d.ip))
         .arcsData(arcs)
         .arcStartLat(d => d.startLat)
@@ -127,6 +132,12 @@
     if (b >= 1048576)    return (b / 1048576).toFixed(1) + ' MB';
     if (b >= 1024)       return (b / 1024).toFixed(1) + ' KB';
     return b + ' B';
+  }
+
+  function esc(s) {
+    return String(s ?? '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 </script>
 
