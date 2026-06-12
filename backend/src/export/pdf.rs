@@ -3,6 +3,12 @@ use printpdf::*;
 use std::io::BufWriter;
 use crate::analysis::AnalysisResult;
 
+// Strip ASCII control characters from user-controlled text before rendering
+// it into a PDF (filenames, hostnames, threat descriptions from pcap data).
+fn sanitize(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() && c != ' ' { '?' } else { c }).collect()
+}
+
 pub fn generate_pdf(result: &AnalysisResult) -> Result<Vec<u8>> {
     let (doc, page1, layer1) = PdfDocument::new(
         "PcapSentry Report",
@@ -14,7 +20,15 @@ pub fn generate_pdf(result: &AnalysisResult) -> Result<Vec<u8>> {
     let font = doc.add_builtin_font(BuiltinFont::Helvetica)?;
     let font_bold = doc.add_builtin_font(BuiltinFont::HelveticaBold)?;
 
-    let layer = doc.get_page(page1).get_layer(layer1);
+    let mut page_num: u32 = 1;
+    let mut layer = doc.get_page(page1).get_layer(layer1);
+
+    // Adds a new page when content runs past the bottom margin.
+    let new_page = |doc: &PdfDocumentReference, page_num: &mut u32| {
+        *page_num += 1;
+        let (p, l) = doc.add_page(Mm(210.0_f32), Mm(297.0_f32), format!("Page {}", page_num));
+        doc.get_page(p).get_layer(l)
+    };
 
     // ─── Cover Section ────────────────────────────────────────────────────────
     let mut y = 270.0_f32;
@@ -25,7 +39,7 @@ pub fn generate_pdf(result: &AnalysisResult) -> Result<Vec<u8>> {
     y -= 6.0;
 
     layer.use_text(
-        &format!("File: {}", result.overview.filename),
+        format!("File: {}", sanitize(&result.overview.filename)),
         11.0, Mm(20.0_f32), Mm(y), &font,
     );
     y -= 6.0;
@@ -55,8 +69,8 @@ pub fn generate_pdf(result: &AnalysisResult) -> Result<Vec<u8>> {
     layer.use_text("Executive Summary", 16.0, Mm(20.0_f32), Mm(y), &font_bold);
     y -= 8.0;
 
-    let unique_ips: std::collections::HashSet<String> = result.packets.iter()
-        .flat_map(|p| [p.src_ip.clone(), p.dst_ip.clone()].into_iter().flatten())
+    let unique_ips: std::collections::HashSet<std::net::IpAddr> = result.packets.iter()
+        .flat_map(|p| [p.src_ip, p.dst_ip].into_iter().flatten())
         .collect();
 
     let summary_lines = vec![
@@ -86,20 +100,25 @@ pub fn generate_pdf(result: &AnalysisResult) -> Result<Vec<u8>> {
 
     for threat in result.threats.iter() {
         if y < 40.0 {
-            y = 270.0; // simple reset; a real impl would switch page layers
+            layer = new_page(&doc, &mut page_num);
+            y = 270.0;
         }
 
-        let title = format!("[{}] {}", threat.severity, threat.title);
+        let title = format!("[{}] {}", sanitize(&threat.severity), sanitize(&threat.title));
         layer.use_text(&title, 12.0, Mm(20.0_f32), Mm(y), &font_bold);
         y -= 6.0;
 
-        for line in &wrap_text(&threat.description, 90) {
+        for line in &wrap_text(&sanitize(&threat.description), 90) {
+            if y < 30.0 {
+                layer = new_page(&doc, &mut page_num);
+                y = 270.0;
+            }
             layer.use_text(line, 10.0, Mm(25.0_f32), Mm(y), &font);
             y -= 5.0;
         }
 
         layer.use_text(
-            &format!("Category: {}  |  Packets: {}", threat.category, threat.packet_indices.len()),
+            format!("Category: {}  |  Packets: {}", sanitize(&threat.category), threat.packet_indices.len()),
             9.0, Mm(25.0_f32), Mm(y), &font,
         );
         y -= 9.0;
@@ -107,21 +126,22 @@ pub fn generate_pdf(result: &AnalysisResult) -> Result<Vec<u8>> {
 
     // ─── Top Talkers ─────────────────────────────────────────────────────────
     y -= 4.0;
+    if y < 50.0 { layer = new_page(&doc, &mut page_num); y = 270.0; }
     layer.use_text("Top Senders", 16.0, Mm(20.0_f32), Mm(y), &font_bold);
     y -= 7.0;
 
     layer.use_text(
-        &format!("{:<20} {:>12} {:>12}", "IP Address", "Packets", "Bytes"),
+        format!("{:<20} {:>12} {:>12}", "IP Address", "Packets", "Bytes"),
         10.0, Mm(20.0_f32), Mm(y), &font_bold,
     );
     y -= 5.0;
 
     for talker in result.top_senders.iter().take(10) {
-        if y < 30.0 { break; }
+        if y < 30.0 { layer = new_page(&doc, &mut page_num); y = 270.0; }
         layer.use_text(
-            &format!(
+            format!(
                 "{:<20} {:>12} {:>12}",
-                truncate(&talker.ip, 20),
+                truncate(&sanitize(&talker.ip), 20),
                 talker.packets_sent,
                 format_bytes(talker.bytes_sent)
             ),
@@ -131,12 +151,13 @@ pub fn generate_pdf(result: &AnalysisResult) -> Result<Vec<u8>> {
     }
 
     y -= 8.0;
+    if y < 50.0 { layer = new_page(&doc, &mut page_num); y = 270.0; }
     layer.use_text("DNS Summary", 16.0, Mm(20.0_f32), Mm(y), &font_bold);
     y -= 7.0;
 
     let suspicious_dns: Vec<_> = result.dns_log.iter().filter(|e| e.suspicious).collect();
     layer.use_text(
-        &format!(
+        format!(
             "Total DNS queries: {}  |  Suspicious: {}",
             result.dns_log.len(),
             suspicious_dns.len()
@@ -146,9 +167,9 @@ pub fn generate_pdf(result: &AnalysisResult) -> Result<Vec<u8>> {
     y -= 6.0;
 
     for entry in suspicious_dns.iter().take(10) {
-        if y < 30.0 { break; }
+        if y < 30.0 { layer = new_page(&doc, &mut page_num); y = 270.0; }
         layer.use_text(
-            &format!("  {} — {}", entry.name, entry.suspicious_reason.as_deref().unwrap_or("")),
+            format!("  {} — {}", sanitize(&entry.name), sanitize(entry.suspicious_reason.as_deref().unwrap_or(""))),
             9.0, Mm(25.0_f32), Mm(y), &font,
         );
         y -= 5.0;
@@ -184,5 +205,8 @@ fn format_bytes(b: usize) -> String {
 }
 
 fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max { s } else { &s[..max] }
+    match s.char_indices().nth(max) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
 }
