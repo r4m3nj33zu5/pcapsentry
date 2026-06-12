@@ -1,6 +1,6 @@
 # PcapSentry
 
-A local .pcap file analysis tool with a blue team security focus. Drop a capture file in the browser, get a dashboard with threat detections, traffic timeline, geo map, DNS/HTTP logs, and packet inspection — all running offline on your machine.
+A local .pcap file analysis tool with a blue team security focus. Drop a capture file in the browser, get a SOC-style dashboard with threat detections, suspicious conversation scoring, traffic timeline, geo map, DNS/HTTP/TLS logs, and packet inspection — all running offline on your machine.
 
 ## Prerequisites
 
@@ -45,34 +45,37 @@ PcapSentry must be run from the `backend/` directory so it can locate the `../fr
 1. Open http://localhost:7777
 2. Drag and drop a `.pcap` or `.pcapng` file onto the upload zone (or click "Browse files")
 3. A progress bar will appear while the capture is parsed
-4. The dashboard loads automatically with:
-   - **Overview bar** — packet count, duration, unique IPs, protocols, threat summary
-   - **Traffic timeline** — packet volume over time
-   - **Threat panel** — findings sorted by severity with plain-English descriptions
-   - **Top talkers** — top senders and receivers by volume
-   - **Geo map** — geolocated external IPs (requires GeoLite2 database)
-   - **DNS/HTTP log** — filterable tables of DNS queries and HTTP transactions
-5. Click "View Packets" on any threat finding to open the Packet Inspector
-6. Click "Export PDF" (via `POST /api/export/:session_id`) to generate a report
-7. Previous sessions from the current run appear in the left sidebar
+4. The dashboard loads with 13 modules: **Triage**, **Alerts**, **Conversations** (suspicious conversations scored by joined alert/beaconing/TLS signals), **Flows**, **DNS**, **HTTP**, **TLS**, **IOC**, **Geo**, **Stats**, **Timeline**, **Packets**, and **Notes**
+5. Click any finding to isolate its packets in the Packet Inspector; TCP streams can be reassembled and viewed inline
+6. "Export PDF" generates a report; CSV export is available per module
+7. Sessions are saved to disk and reappear in the left sidebar after a restart
+8. Alert thresholds, IP/domain whitelists, and optional VirusTotal/Shodan API keys are configurable in the Settings panel
+
+## Supported Captures
+
+- **Formats:** classic pcap and pcapng (auto-detected by magic bytes)
+- **Link layers:** Ethernet (including 802.1Q VLAN and 802.1ad QinQ tagged frames), Linux cooked capture v1 (SLL, from `tcpdump -i any`) and v2 (SLL2)
+- Not supported: 802.11/RadioTap wireless frames, and pcapng files that mix link layers across interfaces in one file
 
 ## Threat Detections
 
 | Detection | Severity |
 |---|---|
 | ARP Spoofing | Critical |
-| Port Scan (SYN) | Critical / High |
-| Xmas / NULL / FIN Scans | High |
-| Beaconing / C2 Indicators | High |
+| Known-malware ports (Metasploit, NetBus, IRC C2, …) | Critical / High |
+| Port Scan (SYN) / Xmas / NULL / FIN Scans | Critical / High |
+| Beaconing / C2 callbacks (TCP + UDP, QUIC exempted) | High |
+| DNS Tunneling / High-entropy DNS labels | High / Medium |
 | Cleartext Credentials (HTTP Basic, FTP) | High |
-| ICMP Sweep | Medium |
+| TLS anomalies / known-bad JA3 fingerprints | High / Medium |
+| SYN / ICMP / UDP Floods (QUIC exempted) | Medium |
+| Oversized ICMP, ICMP Sweep | Medium |
 | Abnormal Traffic Volume | Medium |
 
 ## Limitations
 
-- In-memory only — sessions are lost when the process restarts
-- Inspector is limited to the first 500,000 packets for large captures (analysis still runs on the full file)
-- 802.11 wireless frame parsing requires a capture with RadioTap/IEEE 802.11 linktype
+- Very large captures are truncated to the first 500,000 packets — analysis and detections only cover those packets
+- No 802.11 wireless frame parsing
 - PDF export uses server-side rendering via `printpdf`
 
 ## Project Structure
@@ -82,21 +85,28 @@ pcapsentry/
 ├── backend/          # Rust/Axum server
 │   ├── src/
 │   │   ├── main.rs           # Server, routes, session state
-│   │   ├── parser.rs         # pcap/pcapng parsing and packet decoding
+│   │   ├── parser.rs         # pcap/pcapng parsing, Ethernet/VLAN/SLL decode
+│   │   ├── persistence.rs    # Session save/load (gzipped JSON in data dir)
+│   │   ├── reassembly.rs     # TCP stream reassembly
+│   │   ├── config.rs         # Alert thresholds, whitelist, API keys
 │   │   ├── analysis/
-│   │   │   ├── mod.rs        # Analysis orchestration
-│   │   │   ├── threats.rs    # Threat detection modules
-│   │   │   ├── talkers.rs    # Top talker aggregation
-│   │   │   ├── dns_http.rs   # DNS/HTTP extraction
-│   │   │   └── geo.rs        # IP geolocation
-│   │   └── export/
-│   │       └── pdf.rs        # PDF report generation
+│   │   │   ├── mod.rs            # Analysis orchestration
+│   │   │   ├── indexed.rs        # Pre-indexed packet view for detectors
+│   │   │   ├── alerts.rs         # Alert engine detections
+│   │   │   ├── beaconing.rs      # Beaconing candidate detection
+│   │   │   ├── conversations.rs  # Suspicious conversation scoring
+│   │   │   ├── talkers.rs        # Top talker aggregation
+│   │   │   ├── dns_http.rs       # DNS/HTTP extraction
+│   │   │   ├── tls.rs            # TLS/JA3 analysis
+│   │   │   └── geo.rs            # IP geolocation
+│   │   └── export/           # PDF + CSV report generation
 │   └── build.rs              # Builds frontend before Rust compile
 ├── frontend/         # Svelte/Vite SPA
 │   └── src/
 │       ├── App.svelte
-│       ├── components/       # UI components
+│       ├── components/       # UI components and dashboard modules
 │       └── stores/           # Svelte stores
 └── assets/
-    └── GeoLite2-City.mmdb    # Place your MaxMind DB here
+    ├── ja3_known_bad.csv     # Known-bad JA3 fingerprint list
+    └── GeoLite2-City.mmdb    # Place your MaxMind DB here (optional)
 ```

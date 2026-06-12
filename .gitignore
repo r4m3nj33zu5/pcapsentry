@@ -4,3 +4,4 @@ frontend/dist/
 assets/GeoLite2-City.mmdb
 *.pcap
 *.pcapng
+shannon/
